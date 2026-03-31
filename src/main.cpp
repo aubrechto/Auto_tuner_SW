@@ -1,0 +1,598 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <arduinoFFT.h>
+#include <math.h>
+
+namespace
+{
+constexpr uint8_t RXD2 = 16;
+constexpr uint8_t TXD2 = 17;
+constexpr uint8_t ADC_PIN = 32;
+constexpr uint8_t I2C_SDA = 21;
+constexpr uint8_t I2C_SCL = 22;
+
+constexpr uint8_t WAVEFORM_ID = 1;
+constexpr uint16_t GRAPH_POINTS = 300;
+constexpr uint8_t AMPLITUDE = 127;
+constexpr uint8_t OFFSET = 78;
+
+constexpr uint16_t SAMPLES = 1024;
+constexpr uint16_t SAMPLING_FREQUENCY = 3000;
+constexpr float FFT_CALIBRATION = 1.356f;
+constexpr float FFT_WINDOW_HZ = 15.0f;
+constexpr int ADC_MAX_VALUE = 4095;
+constexpr int MIN_SIGNAL_AMPLITUDE = 150;
+
+constexpr uint16_t SERVO_CENTER = 375;
+constexpr uint16_t SERVO_MAX_OFFSET = 255;
+constexpr int SERVO_RIGHT_DIRECTION = 1;
+constexpr int SERVO_LEFT_DIRECTION = -1;
+constexpr float SERVO_DEADBAND_HZ = 0.15f;
+constexpr unsigned long SERVO_STEP_INTERVAL_MS = 180;
+constexpr unsigned long SERVO_MOVE_TIME_MS = 120;
+constexpr unsigned long SERVO_SETTLE_TIME_MS = 160;
+constexpr uint8_t SERVO_STEP_SMALL = 10;
+constexpr uint8_t SERVO_STEP_MEDIUM = 16;
+constexpr uint8_t SERVO_STEP_LARGE = 24;
+
+constexpr float COARSE_TOLERANCE = 0.50f;
+constexpr float FINE_TOLERANCE = 0.01f;
+constexpr uint8_t REQUIRED_STABLE_READS = 3;
+constexpr unsigned long READ_DELAY_MS = 20;
+constexpr unsigned long POST_STRING_DELAY_MS = 250;
+
+const float STRING_FREQUENCIES[] = {82.41f, 110.00f, 146.83f, 196.00f, 246.94f, 329.63f};
+const char STRING_NOTES[] = {'E', 'A', 'D', 'G', 'H', 'e'};
+const char *const STRING_NAMES[] = {"E2", "A2", "D3", "G3", "B3", "E4"};
+const uint8_t STRING_SERVO_CHANNELS[] = {0, 1, 2, 3, 4, 5};
+
+Adafruit_PWMServoDriver pwmDriver(0x41);
+ArduinoFFT<double> fft;
+
+double vReal[SAMPLES];
+double vImag[SAMPLES];
+
+bool tuningActive = false;
+bool pausedByStop = false;
+int currentStringIndex = 0;
+int stableCount = 0;
+int waveformIndex = 0;
+int lastServoCommand = 0;
+unsigned long lastDisplayUpdateMs = 0;
+unsigned long lastServoStepMs = 0;
+} // namespace
+
+void endCommand()
+{
+  Serial2.write(0xFF);
+  Serial2.write(0xFF);
+  Serial2.write(0xFF);
+}
+
+void clearWaveform()
+{
+  Serial2.print("cle ");
+  Serial2.print(WAVEFORM_ID);
+  Serial2.print(",255");
+  endCommand();
+}
+
+void addPoint(uint8_t channel, uint8_t value)
+{
+  Serial2.print("add ");
+  Serial2.print(WAVEFORM_ID);
+  Serial2.print(",");
+  Serial2.print(channel);
+  Serial2.print(",");
+  Serial2.print(value);
+  endCommand();
+}
+
+void writeText(const String &object, const String &value)
+{
+  Serial2.print(object);
+  Serial2.print(".txt=\"");
+  Serial2.print(value);
+  Serial2.print("\"");
+  endCommand();
+}
+
+void writeNumber(const String &object, int value)
+{
+  Serial2.print(object);
+  Serial2.print(".val=");
+  Serial2.print(value);
+  endCommand();
+}
+
+void setVisible(const String &object, bool visible)
+{
+  Serial2.print("vis ");
+  Serial2.print(object);
+  Serial2.print(",");
+  Serial2.print(visible ? 1 : 0);
+  endCommand();
+}
+
+float noteToFrequency(char instrument, char note)
+{
+  if (instrument == 'k')
+  {
+    switch (note)
+    {
+    case 'E':
+      return 82.41f;
+    case 'A':
+      return 110.00f;
+    case 'D':
+      return 146.83f;
+    case 'G':
+      return 196.00f;
+    case 'H':
+      return 246.94f;
+    case 'e':
+      return 329.63f;
+    default:
+      return 100.0f;
+    }
+  }
+
+  if (instrument == 'b')
+  {
+    switch (note)
+    {
+    case 'E':
+      return 41.2f;
+    case 'A':
+      return 55.0f;
+    case 'D':
+      return 73.42f;
+    case 'G':
+      return 98.0f;
+    default:
+      return 60.0f;
+    }
+  }
+
+  return 80.0f;
+}
+
+uint8_t getServoChannelForString(int stringIndex)
+{
+  return STRING_SERVO_CHANNELS[stringIndex];
+}
+
+void writeServoOffset(uint8_t channel, int offset)
+{
+  const int limitedOffset = constrain(offset, -static_cast<int>(SERVO_MAX_OFFSET), static_cast<int>(SERVO_MAX_OFFSET));
+  pwmDriver.setPWM(channel, 0, SERVO_CENTER + limitedOffset);
+}
+
+void centerServo()
+{
+  for (uint8_t i = 0; i < sizeof(STRING_SERVO_CHANNELS) / sizeof(STRING_SERVO_CHANNELS[0]); ++i)
+  {
+    pwmDriver.setPWM(STRING_SERVO_CHANNELS[i], 0, SERVO_CENTER);
+  }
+  lastServoCommand = 0;
+}
+
+uint8_t getServoStepSize(float absoluteError)
+{
+  if (absoluteError > 8.0f)
+  {
+    return SERVO_STEP_LARGE;
+  }
+
+  if (absoluteError > 2.0f)
+  {
+    return SERVO_STEP_MEDIUM;
+  }
+
+  return SERVO_STEP_SMALL;
+}
+
+void applyServoCorrection(float targetFrequency, float measuredFrequency, int stringIndex)
+{
+  const float errorHz = targetFrequency - measuredFrequency;
+  const float absoluteError = fabsf(errorHz);
+
+  if (absoluteError <= SERVO_DEADBAND_HZ)
+  {
+    lastServoCommand = 0;
+    return;
+  }
+
+  if (millis() - lastServoStepMs < SERVO_STEP_INTERVAL_MS)
+  {
+    return;
+  }
+
+  const uint8_t servoChannel = getServoChannelForString(stringIndex);
+  const int stepSize = getServoStepSize(absoluteError);
+  int servoOffset = 0;
+
+  if (errorHz > 0.0f)
+  {
+    servoOffset = SERVO_LEFT_DIRECTION * stepSize;
+  }
+  else
+  {
+    servoOffset = SERVO_RIGHT_DIRECTION * stepSize;
+  }
+
+  lastServoCommand = servoOffset;
+  writeServoOffset(servoChannel, servoOffset);
+  delay(SERVO_MOVE_TIME_MS);
+  writeServoOffset(servoChannel, 0);
+  delay(SERVO_SETTLE_TIME_MS);
+  lastServoStepMs = millis();
+}
+
+void sendWaveformChunk(char note, float measuredFrequency, int chunkSize)
+{
+  const float referenceFrequency = noteToFrequency('k', note);
+
+  for (int i = 0; i < chunkSize; ++i)
+  {
+    const int index = waveformIndex + i;
+    if (index >= GRAPH_POINTS)
+    {
+      break;
+    }
+
+    const float t = static_cast<float>(index) / static_cast<float>(GRAPH_POINTS - 1);
+    const uint8_t referenceValue = static_cast<uint8_t>(abs(OFFSET + static_cast<int>(AMPLITUDE * sinf(2.0f * PI * t))));
+    addPoint(0, referenceValue);
+
+    const float scaledT = t * (measuredFrequency / referenceFrequency);
+    const uint8_t measuredValue = static_cast<uint8_t>(abs(OFFSET + static_cast<int>(AMPLITUDE * sinf(2.0f * PI * scaledT))));
+    addPoint(1, measuredValue);
+  }
+
+  waveformIndex += chunkSize;
+  if (waveformIndex >= GRAPH_POINTS)
+  {
+    waveformIndex = 0;
+    clearWaveform();
+  }
+}
+
+void resetTuningState()
+{
+  tuningActive = false;
+  currentStringIndex = 0;
+  stableCount = 0;
+  waveformIndex = 0;
+  lastServoStepMs = 0;
+  lastServoCommand = 0;
+  clearWaveform();
+  centerServo();
+  setVisible("stop", 0);
+  writeText("Note", "-");
+  writeNumber("desiredf", 0);
+  writeNumber("currentf", 0);
+}
+
+void startTuning()
+{
+  tuningActive = true;
+  pausedByStop = false;
+  currentStringIndex = 0;
+  stableCount = 0;
+  waveformIndex = 0;
+  lastServoStepMs = 0;
+  lastServoCommand = 0;
+  clearWaveform();
+  centerServo();
+  setVisible("stop", 1);
+  Serial.println("Spoustim ladeni...");
+}
+
+bool handleDisplayCommands()
+{
+  if (!Serial2.available())
+  {
+    return false;
+  }
+
+  const String command = Serial2.readStringUntil('\n');
+  String normalized = command;
+  normalized.trim();
+
+  if (normalized == "PLAY")
+  {
+    startTuning();
+    return true;
+  }
+
+  if (normalized == "STOP")
+  {
+    Serial.println("Prijat prikaz STOP.");
+    pausedByStop = true;
+    resetTuningState();
+    return true;
+  }
+
+  return false;
+}
+
+bool sampleSignal(int &minSample, int &maxSample)
+{
+  minSample = ADC_MAX_VALUE;
+  maxSample = 0;
+
+  for (uint16_t i = 0; i < SAMPLES; ++i)
+  {
+    handleDisplayCommands();
+    if (!tuningActive)
+    {
+      return false;
+    }
+
+    const int sample = analogRead(ADC_PIN);
+    vReal[i] = sample;
+    vImag[i] = 0.0;
+
+    if (sample < minSample)
+    {
+      minSample = sample;
+    }
+    if (sample > maxSample)
+    {
+      maxSample = sample;
+    }
+
+    delayMicroseconds(1000000 / SAMPLING_FREQUENCY);
+  }
+
+  return true;
+}
+
+bool findDominantFrequency(float targetFrequency, double &detectedFrequency, int &signalAmplitude)
+{
+  const float fftLower = targetFrequency - FFT_WINDOW_HZ;
+  const float fftUpper = targetFrequency + FFT_WINDOW_HZ;
+
+  int minSample = ADC_MAX_VALUE;
+  int maxSample = 0;
+  if (!sampleSignal(minSample, maxSample))
+  {
+    return false;
+  }
+
+  fft.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  fft.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
+  fft.complexToMagnitude(vReal, vImag, SAMPLES);
+
+  double maxAmplitude = 0.0;
+  int maxIndex = -1;
+
+  for (uint16_t i = 2; i < SAMPLES / 2; ++i)
+  {
+    const double freq = (static_cast<double>(i) * SAMPLING_FREQUENCY / SAMPLES) / FFT_CALIBRATION;
+    if (freq < 20.0 || freq < fftLower || freq > fftUpper)
+    {
+      continue;
+    }
+
+    if (vReal[i] > maxAmplitude)
+    {
+      maxAmplitude = vReal[i];
+      maxIndex = static_cast<int>(i);
+    }
+  }
+
+  signalAmplitude = (maxSample - minSample) / 2;
+  if (maxIndex < 0)
+  {
+    return false;
+  }
+
+  detectedFrequency = (static_cast<double>(maxIndex) * SAMPLING_FREQUENCY / SAMPLES) / FFT_CALIBRATION;
+  return true;
+}
+
+void updateDisplay(char note, float targetFrequency, float measuredFrequency)
+{
+  writeText("Note", String(note));
+  writeNumber("desiredf", static_cast<int>(lroundf(targetFrequency)));
+  writeNumber("currentf", static_cast<int>(lroundf(measuredFrequency)));
+  sendWaveformChunk(note, measuredFrequency, 10);
+}
+
+const char *getTuningDirection(float targetFrequency, float measuredFrequency)
+{
+  if (measuredFrequency < targetFrequency * (1.0f - FINE_TOLERANCE))
+  {
+    return "NIZKO";
+  }
+
+  if (measuredFrequency > targetFrequency * (1.0f + FINE_TOLERANCE))
+  {
+    return "VYSOKO";
+  }
+
+  return "OK";
+}
+
+void printTuningStatus(const char *stringName, float targetFrequency, float measuredFrequency, int signalAmplitude)
+{
+  const float errorHz = targetFrequency - measuredFrequency;
+
+  Serial.print("Ladim strunu: ");
+  Serial.print(stringName);
+  Serial.print(" | cil: ");
+  Serial.print(targetFrequency, 2);
+  Serial.print(" Hz | freq: ");
+  Serial.print(measuredFrequency, 2);
+  Serial.print(" Hz | A: ");
+  Serial.print(signalAmplitude);
+  Serial.print(" | servo LED");
+  Serial.print(getServoChannelForString(currentStringIndex));
+  Serial.print(": ");
+  Serial.print(lastServoCommand);
+  Serial.print(" (");
+  if (fabsf(errorHz) <= SERVO_DEADBAND_HZ)
+  {
+    Serial.print("STOP");
+  }
+  else if (errorHz > 0.0f)
+  {
+    Serial.print("DOLEVA/UTAHNOUT");
+  }
+  else
+  {
+    Serial.print("DOPRAVA/POVOLIT");
+  }
+  Serial.print(")");
+  Serial.print(" (");
+  Serial.print(getTuningDirection(targetFrequency, measuredFrequency));
+  Serial.println(")");
+}
+
+void printWeakSignalStatus(const char *stringName, float targetFrequency, int signalAmplitude)
+{
+  Serial.print("Ladim strunu: ");
+  Serial.print(stringName);
+  Serial.print(" | cil: ");
+  Serial.print(targetFrequency, 2);
+  Serial.print(" Hz | A: ");
+  Serial.print(signalAmplitude);
+  Serial.print(" | minimum: ");
+  Serial.print(MIN_SIGNAL_AMPLITUDE);
+  Serial.println(" | signal slaby");
+}
+
+void printNoFrequencyStatus(const char *stringName, float targetFrequency, int signalAmplitude)
+{
+  Serial.print("Ladim strunu: ");
+  Serial.print(stringName);
+  Serial.print(" | cil: ");
+  Serial.print(targetFrequency, 2);
+  Serial.print(" Hz | A: ");
+  Serial.print(signalAmplitude);
+  Serial.println(" | frekvence nenalezena");
+}
+
+void processCurrentString()
+{
+  if (currentStringIndex >= static_cast<int>(sizeof(STRING_FREQUENCIES) / sizeof(STRING_FREQUENCIES[0])))
+  {
+    Serial.println("Hotovo! Vsechny struny jsou naladene.");
+    tuningActive = false;
+    return;
+  }
+
+  const float targetFrequency = STRING_FREQUENCIES[currentStringIndex];
+  const char note = STRING_NOTES[currentStringIndex];
+
+  double measuredFrequency = 0.0;
+  int signalAmplitude = 0;
+
+  if (!findDominantFrequency(targetFrequency, measuredFrequency, signalAmplitude))
+  {
+    stableCount = 0;
+    printNoFrequencyStatus(STRING_NAMES[currentStringIndex], targetFrequency, signalAmplitude);
+    return;
+  }
+
+  if (signalAmplitude < MIN_SIGNAL_AMPLITUDE)
+  {
+    stableCount = 0;
+    writeServoOffset(getServoChannelForString(currentStringIndex), 0);
+    lastServoCommand = 0;
+    printWeakSignalStatus(STRING_NAMES[currentStringIndex], targetFrequency, signalAmplitude);
+    return;
+  }
+
+  if (tuningActive && millis() - lastDisplayUpdateMs >= 120)
+  {
+    updateDisplay(note, targetFrequency, static_cast<float>(measuredFrequency));
+    lastDisplayUpdateMs = millis();
+  }
+
+  applyServoCorrection(targetFrequency, static_cast<float>(measuredFrequency), currentStringIndex);
+  printTuningStatus(STRING_NAMES[currentStringIndex], targetFrequency, static_cast<float>(measuredFrequency), signalAmplitude);
+
+  const float coarseLower = targetFrequency * (1.0f - COARSE_TOLERANCE);
+  const float coarseUpper = targetFrequency * (1.0f + COARSE_TOLERANCE);
+  const float fineLower = targetFrequency * (1.0f - FINE_TOLERANCE);
+  const float fineUpper = targetFrequency * (1.0f + FINE_TOLERANCE);
+
+  if (measuredFrequency >= coarseLower && measuredFrequency <= coarseUpper &&
+      measuredFrequency >= fineLower && measuredFrequency <= fineUpper)
+  {
+    ++stableCount;
+    Serial.print("Stabilni: ");
+    Serial.print(stableCount);
+    Serial.print("/");
+    Serial.println(REQUIRED_STABLE_READS);
+
+    if (stableCount >= REQUIRED_STABLE_READS)
+    {
+      Serial.print("NALAZENO: ");
+      Serial.println(STRING_NAMES[currentStringIndex]);
+      ++currentStringIndex;
+      stableCount = 0;
+      waveformIndex = 0;
+      if (tuningActive)
+      {
+        clearWaveform();
+      }
+      writeServoOffset(getServoChannelForString(currentStringIndex - 1), 0);
+      lastServoCommand = 0;
+      delay(POST_STRING_DELAY_MS);
+    }
+  }
+  else
+  {
+    stableCount = 0;
+  }
+
+  delay(READ_DELAY_MS);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  pwmDriver.begin();
+  pwmDriver.setPWMFreq(50);
+
+  analogReadResolution(12);
+  centerServo();
+
+  Serial.println("Auto tuner startuje...");
+  resetTuningState();
+  tuningActive = true;
+  pausedByStop = false;
+  Serial.println("Start ladeni...");
+}
+
+void loop()
+{
+  handleDisplayCommands();
+
+  if (!tuningActive)
+  {
+    if (currentStringIndex >= static_cast<int>(sizeof(STRING_FREQUENCIES) / sizeof(STRING_FREQUENCIES[0])))
+    {
+      delay(100);
+      return;
+    }
+
+    if (pausedByStop)
+    {
+      delay(50);
+      return;
+    }
+
+    tuningActive = true;
+  }
+
+  processCurrentString();
+}
