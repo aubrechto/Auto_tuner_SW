@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <arduinoFFT.h>
@@ -19,32 +18,19 @@ constexpr uint8_t AMPLITUDE = 127;
 constexpr uint8_t OFFSET = 78;
 
 constexpr uint16_t SAMPLES = 2048;
-constexpr uint16_t SAMPLING_FREQUENCY = 1000;
-constexpr float FFT_CALIBRATION = 1.09f;
-constexpr float TARGET_FREQUENCY_TOLERANCE = 0.20f;
-constexpr float HARMONIC_WINDOW_HZ = 8.0f;
+constexpr uint16_t SAMPLING_FREQUENCY = 4000;
+constexpr float FFT_CALIBRATION = 1.0f;
+constexpr float FFT_WINDOW_HZ = 15.0f;
 constexpr float MAINS_50HZ = 50.0f;
 constexpr float MAINS_50HZ_BAND = 3.0f;
 constexpr float MAINS_100HZ = 100.0f;
 constexpr float MAINS_100HZ_BAND = 6.0f;
 constexpr int ADC_MAX_VALUE = 4095;
 constexpr int MIN_SIGNAL_AMPLITUDE = 150;
-constexpr double MIN_SIGNAL_RMS = 35.0;
-constexpr double MIN_PEAK_MAGNITUDE = 500.0;
-constexpr double MIN_PEAK_TO_RMS_RATIO = 6.0;
-constexpr float FUNDAMENTAL_MIN_RATIO = 0.35f;
 
 constexpr uint16_t SERVO_CENTER = 375;
 constexpr uint16_t SERVO_MAX_OFFSET = 255;
-constexpr uint16_t SERVO_COARSE_OFFSET = 160;
-constexpr uint16_t SERVO_MEDIUM_OFFSET = 110;
-constexpr uint16_t SERVO_FINE_OFFSET = 70;
-constexpr unsigned long SERVO_COARSE_PULSE_MS = 220;
-constexpr unsigned long SERVO_MEDIUM_PULSE_MS = 140;
-constexpr unsigned long SERVO_FINE_PULSE_MS = 90;
-constexpr unsigned long SERVO_SETTLE_MS = 220;
-constexpr float SERVO_COARSE_ERROR_HZ = 2.5f;
-constexpr float SERVO_MEDIUM_ERROR_HZ = 0.8f;
+constexpr float SERVO_GAIN = 3.0f;
 
 constexpr float COARSE_TOLERANCE = 0.50f;
 constexpr float FINE_TOLERANCE = 0.01f;
@@ -57,11 +43,11 @@ const char STRING_NOTES[] = {'E', 'A', 'D', 'G', 'H', 'e'};
 const char *const STRING_NAMES[] = {"E2", "A2", "D3", "G3", "B3", "E4"};
 const uint8_t STRING_SERVO_CHANNELS[] = {0, 1, 2, 3, 4, 5};
 
+Adafruit_PWMServoDriver pwmDriver(0x41);
+ArduinoFFT<double> fft;
+
 double vReal[SAMPLES];
 double vImag[SAMPLES];
-int rawSamples[SAMPLES];
-Adafruit_PWMServoDriver pwmDriver(0x41);
-ArduinoFFT<double> fft(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
 
 bool tuningActive = false;
 bool pausedByStop = false;
@@ -69,10 +55,6 @@ int currentStringIndex = 0;
 int stableCount = 0;
 int waveformIndex = 0;
 unsigned long lastDisplayUpdateMs = 0;
-bool servoPulseActive = false;
-uint8_t activeServoChannel = 0;
-unsigned long servoPulseStopAtMs = 0;
-unsigned long nextMeasurementAllowedAtMs = 0;
 } // namespace
 
 void endCommand()
@@ -205,63 +187,14 @@ void stopAllServos()
   }
 }
 
-void startServoPulse(uint8_t channel, bool tightenDirection, uint16_t servoOffset, unsigned long pulseDurationMs)
+void setServoFromError(float targetFrequency, float measuredFrequency)
 {
-  const int signedOffset = tightenDirection ? static_cast<int>(servoOffset) : -static_cast<int>(servoOffset);
-  const uint16_t boundedPulse = constrain(SERVO_CENTER + signedOffset,
-                                          static_cast<int>(SERVO_CENTER - SERVO_MAX_OFFSET),
-                                          static_cast<int>(SERVO_CENTER + SERVO_MAX_OFFSET));
-
-  disableInactiveServos(channel);
-  pwmDriver.setPWM(channel, 0, boundedPulse);
-  servoPulseActive = true;
-  activeServoChannel = channel;
-  servoPulseStopAtMs = millis() + pulseDurationMs;
-}
-
-void serviceServoMotion()
-{
-  if (!servoPulseActive)
-  {
-    return;
-  }
-
-  if (millis() < servoPulseStopAtMs)
-  {
-    return;
-  }
-
-  disableServoChannel(activeServoChannel);
-  servoPulseActive = false;
-  nextMeasurementAllowedAtMs = millis() + SERVO_SETTLE_MS;
-}
-
-bool commandServoStepFromError(float targetFrequency, float measuredFrequency)
-{
-  const float errorHz = measuredFrequency - targetFrequency;
-  const float absErrorHz = fabsf(errorHz);
-  if (absErrorHz <= FINE_TOLERANCE * targetFrequency)
-  {
-    return false;
-  }
-
-  uint16_t servoOffset = SERVO_FINE_OFFSET;
-  unsigned long pulseDurationMs = SERVO_FINE_PULSE_MS;
-  if (absErrorHz >= SERVO_COARSE_ERROR_HZ)
-  {
-    servoOffset = SERVO_COARSE_OFFSET;
-    pulseDurationMs = SERVO_COARSE_PULSE_MS;
-  }
-  else if (absErrorHz >= SERVO_MEDIUM_ERROR_HZ)
-  {
-    servoOffset = SERVO_MEDIUM_OFFSET;
-    pulseDurationMs = SERVO_MEDIUM_PULSE_MS;
-  }
-
-  const uint8_t channel = getServoChannelForCurrentString();
-  const bool tightenDirection = errorHz < 0.0f;
-  startServoPulse(channel, tightenDirection, servoOffset, pulseDurationMs);
-  return true;
+  const float delta = measuredFrequency - targetFrequency;
+  int servoOffset = static_cast<int>(delta * SERVO_GAIN);
+  servoOffset = constrain(servoOffset, -static_cast<int>(SERVO_MAX_OFFSET), static_cast<int>(SERVO_MAX_OFFSET));
+  const uint8_t activeChannel = getServoChannelForCurrentString();
+  disableInactiveServos(activeChannel);
+  pwmDriver.setPWM(activeChannel, 0, SERVO_CENTER + servoOffset);
 }
 
 void centerCurrentServo()
@@ -306,10 +239,6 @@ void resetTuningState()
   currentStringIndex = 0;
   stableCount = 0;
   waveformIndex = 0;
-  servoPulseActive = false;
-  activeServoChannel = 0;
-  servoPulseStopAtMs = 0;
-  nextMeasurementAllowedAtMs = 0;
   clearWaveform();
   stopAllServos();
   setVisible("stop", 0);
@@ -325,9 +254,6 @@ void startTuning()
   currentStringIndex = 0;
   stableCount = 0;
   waveformIndex = 0;
-  servoPulseActive = false;
-  servoPulseStopAtMs = 0;
-  nextMeasurementAllowedAtMs = 0;
   clearWaveform();
   stopAllServos();
   setVisible("stop", 1);
@@ -376,7 +302,8 @@ bool sampleSignal(int &minSample, int &maxSample)
     }
 
     const int sample = analogRead(ADC_PIN);
-    rawSamples[i] = sample;
+    vReal[i] = sample;
+    vImag[i] = 0.0;
 
     if (sample < minSample)
     {
@@ -393,75 +320,11 @@ bool sampleSignal(int &minSample, int &maxSample)
   return true;
 }
 
-void preprocessClippedSignal()
-{
-  double mean = 0.0;
-  for (uint16_t i = 0; i < SAMPLES; ++i)
-  {
-    mean += rawSamples[i];
-  }
-  mean /= static_cast<double>(SAMPLES);
-
-  for (uint16_t i = 0; i < SAMPLES; ++i)
-  {
-    const double clippedHalfWave = mean - static_cast<double>(rawSamples[i]);
-    vReal[i] = clippedHalfWave > 0.0 ? clippedHalfWave : 0.0;
-    vImag[i] = 0.0;
-  }
-}
-
-double calculateSignalRms()
-{
-  double energy = 0.0;
-  for (uint16_t i = 0; i < SAMPLES; ++i)
-  {
-    energy += vReal[i] * vReal[i];
-  }
-
-  return sqrt(energy / static_cast<double>(SAMPLES));
-}
-
-int frequencyToIndex(double frequency)
-{
-  const double binWidth = static_cast<double>(SAMPLING_FREQUENCY) / static_cast<double>(SAMPLES);
-  int index = static_cast<int>(lround(frequency / binWidth));
-  index = constrain(index, 0, static_cast<int>(SAMPLES / 2) - 1);
-  return index;
-}
-
-double findPeakInBand(double centerFrequency, double windowHz, int &peakIndex)
-{
-  const double lowerFrequency = centerFrequency - windowHz;
-  const double upperFrequency = centerFrequency + windowHz;
-
-  const int startIndex = max(2, frequencyToIndex(lowerFrequency));
-  const int endIndex = min(static_cast<int>(SAMPLES / 2) - 1, frequencyToIndex(upperFrequency));
-
-  double peakMagnitude = 0.0;
-  peakIndex = -1;
-
-  for (int i = startIndex; i <= endIndex; ++i)
-  {
-    const double freq = (static_cast<double>(i) * SAMPLING_FREQUENCY / SAMPLES) / FFT_CALIBRATION;
-    const bool in50HzBand = freq >= (MAINS_50HZ - MAINS_50HZ_BAND) && freq <= (MAINS_50HZ + MAINS_50HZ_BAND);
-    const bool in100HzBand = freq >= (MAINS_100HZ - MAINS_100HZ_BAND) && freq <= (MAINS_100HZ + MAINS_100HZ_BAND);
-    if (in50HzBand || in100HzBand)
-    {
-      continue;
-    }
-
-    if (vReal[i] > peakMagnitude)
-    {
-      peakMagnitude = vReal[i];
-      peakIndex = i;
-    }
-  }
-
-  return peakMagnitude;
-}
-
 bool findDominantFrequency(float targetFrequency, double &detectedFrequency, int &signalAmplitude)
 {
+  const float fftLower = targetFrequency - FFT_WINDOW_HZ;
+  const float fftUpper = targetFrequency + FFT_WINDOW_HZ;
+
   int minSample = ADC_MAX_VALUE;
   int maxSample = 0;
   if (!sampleSignal(minSample, maxSample))
@@ -469,47 +332,42 @@ bool findDominantFrequency(float targetFrequency, double &detectedFrequency, int
     return false;
   }
 
+  fft.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  fft.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
+  fft.complexToMagnitude(vReal, vImag, SAMPLES);
+
+  double maxAmplitude = 0.0;
+  int maxIndex = -1;
+
+  for (uint16_t i = 2; i < SAMPLES / 2; ++i)
+  {
+    const double freq = (static_cast<double>(i) * SAMPLING_FREQUENCY / SAMPLES) / FFT_CALIBRATION;
+    if (freq < 20.0 || freq < fftLower || freq > fftUpper)
+    {
+      continue;
+    }
+
+    const bool in50HzBand = freq >= (MAINS_50HZ - MAINS_50HZ_BAND) && freq <= (MAINS_50HZ + MAINS_50HZ_BAND);
+    const bool in100HzBand = freq >= (MAINS_100HZ - MAINS_100HZ_BAND) && freq <= (MAINS_100HZ + MAINS_100HZ_BAND);
+    if (in50HzBand || in100HzBand)
+    {
+      continue;
+    }
+
+    if (vReal[i] > maxAmplitude)
+    {
+      maxAmplitude = vReal[i];
+      maxIndex = static_cast<int>(i);
+    }
+  }
+
   signalAmplitude = (maxSample - minSample) / 2;
-  if (signalAmplitude < MIN_SIGNAL_AMPLITUDE)
+  if (maxIndex < 0)
   {
     return false;
   }
 
-  preprocessClippedSignal();
-  const double signalRms = calculateSignalRms();
-  if (signalRms < MIN_SIGNAL_RMS)
-  {
-    return false;
-  }
-
-  fft.windowing(FFTWindow::Hamming, FFTDirection::Forward);
-  fft.compute(FFTDirection::Forward);
-  fft.complexToMagnitude();
-
-  const double searchWindowHz = targetFrequency * TARGET_FREQUENCY_TOLERANCE;
-  int fundamentalIndex = -1;
-  const double fundamentalMagnitude = findPeakInBand(targetFrequency, searchWindowHz, fundamentalIndex);
-  if (fundamentalIndex < 0)
-  {
-    return false;
-  }
-
-  if (fundamentalMagnitude < MIN_PEAK_MAGNITUDE || (fundamentalMagnitude / signalRms) < MIN_PEAK_TO_RMS_RATIO)
-  {
-    return false;
-  }
-
-  int secondHarmonicIndex = -1;
-  const double secondHarmonicMagnitude = findPeakInBand(targetFrequency * 2.0f, HARMONIC_WINDOW_HZ, secondHarmonicIndex);
-
-  int selectedIndex = fundamentalIndex;
-  if (secondHarmonicIndex >= 0 && fundamentalMagnitude > 0.0 &&
-      secondHarmonicMagnitude < (fundamentalMagnitude / FUNDAMENTAL_MIN_RATIO))
-  {
-    selectedIndex = fundamentalIndex;
-  }
-
-  detectedFrequency = (static_cast<double>(selectedIndex) * SAMPLING_FREQUENCY / SAMPLES) / FFT_CALIBRATION;
+  detectedFrequency = (static_cast<double>(maxIndex) * SAMPLING_FREQUENCY / SAMPLES) / FFT_CALIBRATION;
   return true;
 }
 
@@ -586,18 +444,10 @@ void printNoFrequencyStatus(const char *stringName, float targetFrequency, int s
 
 void processCurrentString()
 {
-  serviceServoMotion();
-
   if (currentStringIndex >= static_cast<int>(sizeof(STRING_FREQUENCIES) / sizeof(STRING_FREQUENCIES[0])))
   {
     Serial.println("Hotovo! Vsechny struny jsou naladene.");
     tuningActive = false;
-    return;
-  }
-
-  if (servoPulseActive || millis() < nextMeasurementAllowedAtMs)
-  {
-    delay(READ_DELAY_MS);
     return;
   }
 
@@ -617,10 +467,12 @@ void processCurrentString()
   if (signalAmplitude < MIN_SIGNAL_AMPLITUDE)
   {
     stableCount = 0;
-    disableServoChannel(getServoChannelForCurrentString());
+    centerCurrentServo();
     printWeakSignalStatus(STRING_NAMES[currentStringIndex], targetFrequency, signalAmplitude);
     return;
   }
+
+  setServoFromError(targetFrequency, static_cast<float>(measuredFrequency));
 
   if (tuningActive && millis() - lastDisplayUpdateMs >= 120)
   {
@@ -639,7 +491,7 @@ void processCurrentString()
   if (measuredFrequency >= coarseLower && measuredFrequency <= coarseUpper &&
       withinFineRange)
   {
-    disableServoChannel(getServoChannelForCurrentString());
+    centerCurrentServo();
     ++stableCount;
     Serial.print("Stabilni: ");
     Serial.print(stableCount);
@@ -665,14 +517,6 @@ void processCurrentString()
   else
   {
     stableCount = 0;
-    if (commandServoStepFromError(targetFrequency, static_cast<float>(measuredFrequency)))
-    {
-      Serial.print("Servo krok pro ");
-      Serial.print(STRING_NAMES[currentStringIndex]);
-      Serial.print(" | chyba: ");
-      Serial.print(static_cast<float>(measuredFrequency) - targetFrequency, 2);
-      Serial.println(" Hz");
-    }
   }
 
   delay(READ_DELAY_MS);
