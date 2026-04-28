@@ -2,8 +2,37 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
-#include <arduinoFFT.h>
 #include <math.h>
+
+#include <DisplayComm.h>
+#include <LogMirror.h>
+#include <OtaTelnet.h>
+#include <TimeFrequencyTracker.h>
+
+#if defined(__has_include)
+#if __has_include("wifi_secrets.h")
+#include "wifi_secrets.h"
+#endif
+#endif
+
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS ""
+#endif
+#ifndef OTA_HOSTNAME
+#define OTA_HOSTNAME "auto-tuner"
+#endif
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD ""
+#endif
+#ifndef TELNET_PORT
+#define TELNET_PORT 23
+#endif
+#ifndef TELNET_PASSWORD
+#define TELNET_PASSWORD ""
+#endif
 
 namespace
 {
@@ -12,27 +41,6 @@ constexpr uint8_t TXD2 = 17;
 constexpr uint8_t ADC_PIN = 32;
 constexpr uint8_t I2C_SDA = 21;
 constexpr uint8_t I2C_SCL = 22;
-
-constexpr uint8_t WAVEFORM_ID = 1;
-constexpr uint16_t GRAPH_POINTS = 300;
-constexpr uint8_t AMPLITUDE = 127;
-constexpr uint8_t OFFSET = 78;
-
-constexpr uint16_t SAMPLES = 2048;
-constexpr uint16_t SAMPLING_FREQUENCY = 1000;
-constexpr float FFT_CALIBRATION = 1.09f;
-constexpr float TARGET_FREQUENCY_TOLERANCE = 0.20f;
-constexpr float HARMONIC_WINDOW_HZ = 8.0f;
-constexpr float MAINS_50HZ = 50.0f;
-constexpr float MAINS_50HZ_BAND = 3.0f;
-constexpr float MAINS_100HZ = 100.0f;
-constexpr float MAINS_100HZ_BAND = 6.0f;
-constexpr int ADC_MAX_VALUE = 4095;
-constexpr int MIN_SIGNAL_AMPLITUDE = 150;
-constexpr double MIN_SIGNAL_RMS = 35.0;
-constexpr double MIN_PEAK_MAGNITUDE = 500.0;
-constexpr double MIN_PEAK_TO_RMS_RATIO = 6.0;
-constexpr float FUNDAMENTAL_MIN_RATIO = 0.35f;
 
 constexpr uint16_t SERVO_CENTER = 375;
 constexpr uint16_t SERVO_MAX_OFFSET = 255;
@@ -49,130 +57,337 @@ constexpr float SERVO_MEDIUM_ERROR_HZ = 0.8f;
 constexpr float COARSE_TOLERANCE = 0.50f;
 constexpr float FINE_TOLERANCE = 0.01f;
 constexpr uint8_t REQUIRED_STABLE_READS = 3;
-constexpr unsigned long READ_DELAY_MS = 20;
 constexpr unsigned long POST_STRING_DELAY_MS = 250;
+constexpr unsigned long WIFI_OFF_DELAY_MS = 150;
 
-const float STRING_FREQUENCIES[] = {82.41f, 110.00f, 146.83f, 196.00f, 246.94f, 329.63f};
-const char STRING_NOTES[] = {'E', 'A', 'D', 'G', 'H', 'e'};
-const char *const STRING_NAMES[] = {"E2", "A2", "D3", "G3", "B3", "E4"};
-const uint8_t STRING_SERVO_CHANNELS[] = {0, 1, 2, 3, 4, 5};
+constexpr float TRACKER_SAMPLE_RATE_HZ = 4000.0f;
+constexpr uint32_t TRACKER_SAMPLE_PERIOD_US = static_cast<uint32_t>(1000000.0f / TRACKER_SAMPLE_RATE_HZ);
+constexpr size_t TRACKER_WINDOW_SIZE = 512;
+constexpr size_t TRACKER_HOP_SIZE = 256;
+constexpr float TRACKER_FREQUENCY_STEP_HZ = 1.0f;
+constexpr float TRACKER_LOW_PASS_ALPHA = 0.18f;
+constexpr float TRACKER_EMA_ALPHA = 0.90f;
+constexpr float TRACKER_MIN_SIGNAL_RMS = 35.0f;
+constexpr float TRACKER_MIN_PEAK_TO_PEAK = 260.0f;
+constexpr float TRACKER_MIN_SWEEP_HZ = 60.0f;
+constexpr float TRACKER_MAX_SWEEP_HZ = 360.0f;
+constexpr float TRACKER_SWEEP_LOW_RATIO = 0.55f;
+constexpr float TRACKER_SWEEP_HIGH_RATIO = 1.55f;
+constexpr float TRACKER_HARMONIC_WEIGHT_2 = 0.75f;
+constexpr float TRACKER_HARMONIC_WEIGHT_3 = 0.35f;
+constexpr float TRACKER_REJECT_CENTER_HZ = 100.0f;
+constexpr float TRACKER_REJECT_HALF_WIDTH_HZ = 4.0f;
+constexpr uint8_t TRACKER_MAX_SAMPLES_PER_SERVICE = 16;
+constexpr uint8_t TRACKER_MAX_TIMING_LAG_SAMPLES = 8;
 
-double vReal[SAMPLES];
-double vImag[SAMPLES];
-int rawSamples[SAMPLES];
+struct StringConfig
+{
+  float desiredHz;
+  char note;
+  const char *name;
+  uint8_t servoChannel;
+};
+
+constexpr StringConfig STRINGS[] = {
+    {82.41f, 'E', "E2", 0},
+    {110.00f, 'A', "A2", 1},
+    {146.83f, 'D', "D3", 2},
+    {196.00f, 'G', "G3", 3},
+    {246.94f, 'H', "B3", 4},
+    {329.63f, 'e', "E4", 5},
+};
+constexpr size_t STRING_COUNT = sizeof(STRINGS) / sizeof(STRINGS[0]);
+
+struct StringTuningResult
+{
+  float desiredHz = 0.0f;
+  float tunedHz = 0.0f;
+  bool hasMeasurement = false;
+};
+
+enum class TunerState : uint8_t
+{
+  Idle,
+  Preparing,
+  Tuning,
+  Finished,
+};
+
 Adafruit_PWMServoDriver pwmDriver(0x41);
-ArduinoFFT<double> fft(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
+TimeFrequencyTracker::GoertzelSweepTracker frequencyTracker;
 
-bool tuningActive = false;
+TunerState tunerState = TunerState::Idle;
 bool pausedByStop = false;
 int currentStringIndex = 0;
 int stableCount = 0;
-int waveformIndex = 0;
 unsigned long lastDisplayUpdateMs = 0;
 bool servoPulseActive = false;
 uint8_t activeServoChannel = 0;
 unsigned long servoPulseStopAtMs = 0;
 unsigned long nextMeasurementAllowedAtMs = 0;
+bool filtersEnabled = true;
+unsigned long preparingStartedAtMs = 0;
+bool preparingInitialized = false;
+bool pendingFinishedReport = false;
+StringTuningResult results[STRING_COUNT];
+bool trackerConfigured = false;
+int trackerConfiguredStringIndex = -1;
+bool trackerConfiguredLowPass = false;
+uint32_t nextTrackerSampleAtUs = 0;
+uint32_t trackerEstimateSequence = 0;
+uint32_t consumedEstimateSequence = 0;
+TimeFrequencyTracker::Estimate latestTrackerEstimate{};
+
+namespace WifiControl
+{
+void enable() { OtaTelnet::enableRadio(); }
+void disable() { OtaTelnet::disableRadio(); }
+bool isEnabled() { return OtaTelnet::isRadioEnabled(); }
+} // namespace WifiControl
+
+void pollConsoleCommands();
+bool ensureFrequencyTrackerReady();
+void resetFrequencyTracker(bool reconfigure = false);
+void serviceFrequencyTracker();
+bool takeLatestFrequencyEstimate(TimeFrequencyTracker::Estimate &estimate);
 } // namespace
+bool requestStartTuning();
+void abortTuning(bool byStop);
+void resetUiToIdle();
 
-void endCommand()
+void serviceBackground()
 {
-  Serial2.write(0xFF);
-  Serial2.write(0xFF);
-  Serial2.write(0xFF);
+  DisplayComm::poll();
+  OtaTelnet::loop();
+  LogMirror::setMirror(OtaTelnet::console());
+  pollConsoleCommands();
 }
 
-void clearWaveform()
+namespace
 {
-  Serial2.print("cle ");
-  Serial2.print(WAVEFORM_ID);
-  Serial2.print(",255");
-  endCommand();
-}
-
-void addPoint(uint8_t channel, uint8_t value)
+void handleConsoleCommand(String line)
 {
-  Serial2.print("add ");
-  Serial2.print(WAVEFORM_ID);
-  Serial2.print(",");
-  Serial2.print(channel);
-  Serial2.print(",");
-  Serial2.print(value);
-  endCommand();
-}
-
-void writeText(const String &object, const String &value)
-{
-  Serial2.print(object);
-  Serial2.print(".txt=\"");
-  Serial2.print(value);
-  Serial2.print("\"");
-  endCommand();
-}
-
-void writeNumber(const String &object, int value)
-{
-  Serial2.print(object);
-  Serial2.print(".val=");
-  Serial2.print(value);
-  endCommand();
-}
-
-void setVisible(const String &object, bool visible)
-{
-  Serial2.print("vis ");
-  Serial2.print(object);
-  Serial2.print(",");
-  Serial2.print(visible ? 1 : 0);
-  endCommand();
-}
-
-float noteToFrequency(char instrument, char note)
-{
-  if (instrument == 'k')
+  line.trim();
+  if (line.length() == 0)
   {
-    switch (note)
-    {
-    case 'E':
-      return 82.41f;
-    case 'A':
-      return 110.00f;
-    case 'D':
-      return 146.83f;
-    case 'G':
-      return 196.00f;
-    case 'H':
-      return 246.94f;
-    case 'e':
-      return 329.63f;
-    default:
-      return 100.0f;
-    }
+    return;
   }
 
-  if (instrument == 'b')
+  String lower = line;
+  lower.toLowerCase();
+
+  if (lower == "filters on")
   {
-    switch (note)
-    {
-    case 'E':
-      return 41.2f;
-    case 'A':
-      return 55.0f;
-    case 'D':
-      return 73.42f;
-    case 'G':
-      return 98.0f;
-    default:
-      return 60.0f;
-    }
+    filtersEnabled = true;
+    LogMirror::out().println("Filters: ON");
+    return;
   }
 
-  return 80.0f;
+  if (lower == "filters off")
+  {
+    filtersEnabled = false;
+    LogMirror::out().println("Filters: OFF");
+    return;
+  }
+
+  if (lower == "filters")
+  {
+    LogMirror::out().println(String("Filters: ") + (filtersEnabled ? "ON" : "OFF"));
+    return;
+  }
 }
+
+void pollConsoleCommands()
+{
+  static String line;
+
+  while (Serial.available() > 0)
+  {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\r')
+    {
+      continue;
+    }
+
+    if (c == '\n')
+    {
+      handleConsoleCommand(line);
+      line = "";
+      continue;
+    }
+
+    if (line.length() < 160)
+    {
+      line += c;
+    }
+  }
+}
+
+float getTrackerMinFrequency(float targetFrequency)
+{
+  const float scaledMin = targetFrequency * TRACKER_SWEEP_LOW_RATIO;
+  return max(TRACKER_MIN_SWEEP_HZ, scaledMin);
+}
+
+float getTrackerMaxFrequency(float targetFrequency)
+{
+  const float scaledMax = targetFrequency * TRACKER_SWEEP_HIGH_RATIO;
+  return min(TRACKER_MAX_SWEEP_HZ, scaledMax);
+}
+
+bool configureFrequencyTrackerForString(int stringIndex)
+{
+  if (stringIndex < 0 || stringIndex >= static_cast<int>(STRING_COUNT))
+  {
+    trackerConfigured = false;
+    trackerConfiguredStringIndex = -1;
+    return false;
+  }
+
+  const float targetFrequency = STRINGS[stringIndex].desiredHz;
+  TimeFrequencyTracker::Config config;
+  config.sampleRateHz = TRACKER_SAMPLE_RATE_HZ;
+  config.windowSize = TRACKER_WINDOW_SIZE;
+  config.hopSize = TRACKER_HOP_SIZE;
+  config.minFrequencyHz = getTrackerMinFrequency(targetFrequency);
+  config.maxFrequencyHz = getTrackerMaxFrequency(targetFrequency);
+  config.frequencyStepHz = TRACKER_FREQUENCY_STEP_HZ;
+  config.enableLowPass = filtersEnabled;
+  config.lowPassAlpha = TRACKER_LOW_PASS_ALPHA;
+  config.emaAlpha = TRACKER_EMA_ALPHA;
+  config.minSignalRms = TRACKER_MIN_SIGNAL_RMS;
+  config.minPeakToPeak = TRACKER_MIN_PEAK_TO_PEAK;
+  config.harmonicWeight2 = TRACKER_HARMONIC_WEIGHT_2;
+  config.harmonicWeight3 = TRACKER_HARMONIC_WEIGHT_3;
+  config.enableRejectBand = filtersEnabled;
+  config.rejectBandCenterHz = TRACKER_REJECT_CENTER_HZ;
+  config.rejectBandHalfWidthHz = TRACKER_REJECT_HALF_WIDTH_HZ;
+
+  trackerConfigured = frequencyTracker.begin(config);
+  trackerConfiguredStringIndex = trackerConfigured ? stringIndex : -1;
+  trackerConfiguredLowPass = filtersEnabled;
+  trackerEstimateSequence = 0;
+  consumedEstimateSequence = 0;
+  latestTrackerEstimate = {};
+  nextTrackerSampleAtUs = micros();
+
+  auto &log = LogMirror::out();
+  if (trackerConfigured)
+  {
+    log.print("Tracker pripraven pro ");
+    log.print(STRINGS[stringIndex].name);
+    log.print(" | rozsah: ");
+    log.print(config.minFrequencyHz, 1);
+    log.print("-");
+    log.print(config.maxFrequencyHz, 1);
+    log.println(" Hz");
+  }
+  else
+  {
+    log.println("Chyba: tracker se nepodarilo inicializovat.");
+  }
+
+  return trackerConfigured;
+}
+
+void resetFrequencyTracker(bool reconfigure)
+{
+  trackerEstimateSequence = 0;
+  consumedEstimateSequence = 0;
+  latestTrackerEstimate = {};
+  nextTrackerSampleAtUs = micros();
+
+  if (reconfigure)
+  {
+    configureFrequencyTrackerForString(currentStringIndex);
+    return;
+  }
+
+  if (trackerConfigured)
+  {
+    frequencyTracker.reset();
+  }
+}
+
+bool ensureFrequencyTrackerReady()
+{
+  if (currentStringIndex < 0 || currentStringIndex >= static_cast<int>(STRING_COUNT))
+  {
+    return false;
+  }
+
+  if (!trackerConfigured ||
+      trackerConfiguredStringIndex != currentStringIndex ||
+      trackerConfiguredLowPass != filtersEnabled)
+  {
+    return configureFrequencyTrackerForString(currentStringIndex);
+  }
+
+  return true;
+}
+
+bool measurementAllowed()
+{
+  return tunerState == TunerState::Tuning &&
+         !servoPulseActive &&
+         millis() >= nextMeasurementAllowedAtMs &&
+         currentStringIndex >= 0 &&
+         currentStringIndex < static_cast<int>(STRING_COUNT);
+}
+
+void serviceFrequencyTracker()
+{
+  if (!measurementAllowed())
+  {
+    return;
+  }
+
+  if (!ensureFrequencyTrackerReady())
+  {
+    return;
+  }
+
+  const uint32_t nowUs = micros();
+  const uint32_t maxLagUs = TRACKER_SAMPLE_PERIOD_US * TRACKER_MAX_TIMING_LAG_SAMPLES;
+  if (static_cast<int32_t>(nowUs - nextTrackerSampleAtUs) > static_cast<int32_t>(maxLagUs))
+  {
+    nextTrackerSampleAtUs = nowUs;
+  }
+
+  uint8_t samplesProcessed = 0;
+  while (samplesProcessed < TRACKER_MAX_SAMPLES_PER_SERVICE &&
+         static_cast<int32_t>(micros() - nextTrackerSampleAtUs) >= 0)
+  {
+    nextTrackerSampleAtUs += TRACKER_SAMPLE_PERIOD_US;
+
+    TimeFrequencyTracker::Estimate estimate;
+    const float sample = static_cast<float>(analogRead(ADC_PIN));
+    if (frequencyTracker.pushSample(sample, estimate))
+    {
+      latestTrackerEstimate = estimate;
+      ++trackerEstimateSequence;
+    }
+
+    ++samplesProcessed;
+  }
+}
+
+bool takeLatestFrequencyEstimate(TimeFrequencyTracker::Estimate &estimate)
+{
+  if (trackerEstimateSequence == 0 || trackerEstimateSequence == consumedEstimateSequence)
+  {
+    return false;
+  }
+
+  estimate = latestTrackerEstimate;
+  consumedEstimateSequence = trackerEstimateSequence;
+  return true;
+}
+} // namespace
 
 uint8_t getServoChannelForCurrentString()
 {
-  return STRING_SERVO_CHANNELS[currentStringIndex];
+  return STRINGS[currentStringIndex].servoChannel;
 }
 
 void centerServoChannel(uint8_t channel)
@@ -187,9 +402,9 @@ void disableServoChannel(uint8_t channel)
 
 void disableInactiveServos(uint8_t activeChannel)
 {
-  for (uint8_t i = 0; i < sizeof(STRING_SERVO_CHANNELS) / sizeof(STRING_SERVO_CHANNELS[0]); ++i)
+  for (size_t i = 0; i < STRING_COUNT; ++i)
   {
-    const uint8_t channel = STRING_SERVO_CHANNELS[i];
+    const uint8_t channel = STRINGS[i].servoChannel;
     if (channel != activeChannel)
     {
       disableServoChannel(channel);
@@ -199,9 +414,9 @@ void disableInactiveServos(uint8_t activeChannel)
 
 void stopAllServos()
 {
-  for (uint8_t i = 0; i < sizeof(STRING_SERVO_CHANNELS) / sizeof(STRING_SERVO_CHANNELS[0]); ++i)
+  for (size_t i = 0; i < STRING_COUNT; ++i)
   {
-    disableServoChannel(STRING_SERVO_CHANNELS[i]);
+    disableServoChannel(STRINGS[i].servoChannel);
   }
 }
 
@@ -217,6 +432,7 @@ void startServoPulse(uint8_t channel, bool tightenDirection, uint16_t servoOffse
   servoPulseActive = true;
   activeServoChannel = channel;
   servoPulseStopAtMs = millis() + pulseDurationMs;
+  resetFrequencyTracker();
 }
 
 void serviceServoMotion()
@@ -271,254 +487,25 @@ void centerCurrentServo()
   centerServoChannel(activeChannel);
 }
 
-void sendWaveformChunk(char note, float measuredFrequency, int chunkSize)
-{
-  const float referenceFrequency = noteToFrequency('k', note);
-
-  for (int i = 0; i < chunkSize; ++i)
-  {
-    const int index = waveformIndex + i;
-    if (index >= GRAPH_POINTS)
-    {
-      break;
-    }
-
-    const float t = static_cast<float>(index) / static_cast<float>(GRAPH_POINTS - 1);
-    const uint8_t referenceValue = static_cast<uint8_t>(abs(OFFSET + static_cast<int>(AMPLITUDE * sinf(2.0f * PI * t))));
-    addPoint(0, referenceValue);
-
-    const float scaledT = t * (measuredFrequency / referenceFrequency);
-    const uint8_t measuredValue = static_cast<uint8_t>(abs(OFFSET + static_cast<int>(AMPLITUDE * sinf(2.0f * PI * scaledT))));
-    addPoint(1, measuredValue);
-  }
-
-  waveformIndex += chunkSize;
-  if (waveformIndex >= GRAPH_POINTS)
-  {
-    waveformIndex = 0;
-    clearWaveform();
-  }
-}
-
 void resetTuningState()
 {
-  tuningActive = false;
   currentStringIndex = 0;
   stableCount = 0;
-  waveformIndex = 0;
   servoPulseActive = false;
   activeServoChannel = 0;
   servoPulseStopAtMs = 0;
   nextMeasurementAllowedAtMs = 0;
-  clearWaveform();
+  trackerConfigured = false;
+  trackerConfiguredStringIndex = -1;
+  trackerConfiguredLowPass = false;
+  resetFrequencyTracker();
+  DisplayComm::resetWaveform();
   stopAllServos();
-  setVisible("stop", 0);
-  writeText("Note", "-");
-  writeNumber("desiredf", 0);
-  writeNumber("currentf", 0);
-}
-
-void startTuning()
-{
-  tuningActive = true;
-  pausedByStop = false;
-  currentStringIndex = 0;
-  stableCount = 0;
-  waveformIndex = 0;
-  servoPulseActive = false;
-  servoPulseStopAtMs = 0;
-  nextMeasurementAllowedAtMs = 0;
-  clearWaveform();
-  stopAllServos();
-  setVisible("stop", 1);
-  Serial.println("Spoustim ladeni...");
-}
-
-bool handleDisplayCommands()
-{
-  if (!Serial2.available())
-  {
-    return false;
-  }
-
-  const String command = Serial2.readStringUntil('\n');
-  String normalized = command;
-  normalized.trim();
-
-  if (normalized == "PLAY")
-  {
-    startTuning();
-    return true;
-  }
-
-  if (normalized == "STOP")
-  {
-    Serial.println("Prijat prikaz STOP.");
-    pausedByStop = true;
-    resetTuningState();
-    return true;
-  }
-
-  return false;
-}
-
-bool sampleSignal(int &minSample, int &maxSample)
-{
-  minSample = ADC_MAX_VALUE;
-  maxSample = 0;
-
-  for (uint16_t i = 0; i < SAMPLES; ++i)
-  {
-    handleDisplayCommands();
-    if (!tuningActive)
-    {
-      return false;
-    }
-
-    const int sample = analogRead(ADC_PIN);
-    rawSamples[i] = sample;
-
-    if (sample < minSample)
-    {
-      minSample = sample;
-    }
-    if (sample > maxSample)
-    {
-      maxSample = sample;
-    }
-
-    delayMicroseconds(1000000 / SAMPLING_FREQUENCY);
-  }
-
-  return true;
-}
-
-void preprocessClippedSignal()
-{
-  double mean = 0.0;
-  for (uint16_t i = 0; i < SAMPLES; ++i)
-  {
-    mean += rawSamples[i];
-  }
-  mean /= static_cast<double>(SAMPLES);
-
-  for (uint16_t i = 0; i < SAMPLES; ++i)
-  {
-    const double clippedHalfWave = mean - static_cast<double>(rawSamples[i]);
-    vReal[i] = clippedHalfWave > 0.0 ? clippedHalfWave : 0.0;
-    vImag[i] = 0.0;
-  }
-}
-
-double calculateSignalRms()
-{
-  double energy = 0.0;
-  for (uint16_t i = 0; i < SAMPLES; ++i)
-  {
-    energy += vReal[i] * vReal[i];
-  }
-
-  return sqrt(energy / static_cast<double>(SAMPLES));
-}
-
-int frequencyToIndex(double frequency)
-{
-  const double binWidth = static_cast<double>(SAMPLING_FREQUENCY) / static_cast<double>(SAMPLES);
-  int index = static_cast<int>(lround(frequency / binWidth));
-  index = constrain(index, 0, static_cast<int>(SAMPLES / 2) - 1);
-  return index;
-}
-
-double findPeakInBand(double centerFrequency, double windowHz, int &peakIndex)
-{
-  const double lowerFrequency = centerFrequency - windowHz;
-  const double upperFrequency = centerFrequency + windowHz;
-
-  const int startIndex = max(2, frequencyToIndex(lowerFrequency));
-  const int endIndex = min(static_cast<int>(SAMPLES / 2) - 1, frequencyToIndex(upperFrequency));
-
-  double peakMagnitude = 0.0;
-  peakIndex = -1;
-
-  for (int i = startIndex; i <= endIndex; ++i)
-  {
-    const double freq = (static_cast<double>(i) * SAMPLING_FREQUENCY / SAMPLES) / FFT_CALIBRATION;
-    const bool in50HzBand = freq >= (MAINS_50HZ - MAINS_50HZ_BAND) && freq <= (MAINS_50HZ + MAINS_50HZ_BAND);
-    const bool in100HzBand = freq >= (MAINS_100HZ - MAINS_100HZ_BAND) && freq <= (MAINS_100HZ + MAINS_100HZ_BAND);
-    if (in50HzBand || in100HzBand)
-    {
-      continue;
-    }
-
-    if (vReal[i] > peakMagnitude)
-    {
-      peakMagnitude = vReal[i];
-      peakIndex = i;
-    }
-  }
-
-  return peakMagnitude;
-}
-
-bool findDominantFrequency(float targetFrequency, double &detectedFrequency, int &signalAmplitude)
-{
-  int minSample = ADC_MAX_VALUE;
-  int maxSample = 0;
-  if (!sampleSignal(minSample, maxSample))
-  {
-    return false;
-  }
-
-  signalAmplitude = (maxSample - minSample) / 2;
-  if (signalAmplitude < MIN_SIGNAL_AMPLITUDE)
-  {
-    return false;
-  }
-
-  preprocessClippedSignal();
-  const double signalRms = calculateSignalRms();
-  if (signalRms < MIN_SIGNAL_RMS)
-  {
-    return false;
-  }
-
-  fft.windowing(FFTWindow::Hamming, FFTDirection::Forward);
-  fft.compute(FFTDirection::Forward);
-  fft.complexToMagnitude();
-
-  const double searchWindowHz = targetFrequency * TARGET_FREQUENCY_TOLERANCE;
-  int fundamentalIndex = -1;
-  const double fundamentalMagnitude = findPeakInBand(targetFrequency, searchWindowHz, fundamentalIndex);
-  if (fundamentalIndex < 0)
-  {
-    return false;
-  }
-
-  if (fundamentalMagnitude < MIN_PEAK_MAGNITUDE || (fundamentalMagnitude / signalRms) < MIN_PEAK_TO_RMS_RATIO)
-  {
-    return false;
-  }
-
-  int secondHarmonicIndex = -1;
-  const double secondHarmonicMagnitude = findPeakInBand(targetFrequency * 2.0f, HARMONIC_WINDOW_HZ, secondHarmonicIndex);
-
-  int selectedIndex = fundamentalIndex;
-  if (secondHarmonicIndex >= 0 && fundamentalMagnitude > 0.0 &&
-      secondHarmonicMagnitude < (fundamentalMagnitude / FUNDAMENTAL_MIN_RATIO))
-  {
-    selectedIndex = fundamentalIndex;
-  }
-
-  detectedFrequency = (static_cast<double>(selectedIndex) * SAMPLING_FREQUENCY / SAMPLES) / FFT_CALIBRATION;
-  return true;
 }
 
 void updateDisplay(char note, float targetFrequency, float measuredFrequency)
 {
-  writeText("Note", String(note));
-  writeNumber("desiredf", static_cast<int>(lroundf(targetFrequency)));
-  writeNumber("currentf", static_cast<int>(lroundf(measuredFrequency)));
-  sendWaveformChunk(note, measuredFrequency, 10);
+  DisplayComm::updateDisplay(note, targetFrequency, measuredFrequency);
 }
 
 const char *getTuningDirection(float targetFrequency, float measuredFrequency)
@@ -536,99 +523,129 @@ const char *getTuningDirection(float targetFrequency, float measuredFrequency)
   return "OK";
 }
 
-void printTuningStatus(const char *stringName, float targetFrequency, float measuredFrequency, int signalAmplitude)
+void printTuningStatus(const char *stringName,
+                       float targetFrequency,
+                       float measuredFrequency,
+                       const TimeFrequencyTracker::Estimate &estimate)
 {
-  Serial.print("Ladim strunu: ");
-  Serial.print(stringName);
-  Serial.print(" | aktivni LED: ");
-  Serial.print("LED");
-  Serial.print(getServoChannelForCurrentString());
-  Serial.print(" | cil: ");
-  Serial.print(targetFrequency, 2);
-  Serial.print(" Hz | freq: ");
-  Serial.print(measuredFrequency, 2);
-  Serial.print(" Hz | A: ");
-  Serial.print(signalAmplitude);
-  Serial.print(" (");
-  Serial.print(getTuningDirection(targetFrequency, measuredFrequency));
-  Serial.println(")");
+  auto &log = LogMirror::out();
+  log.print("Ladim strunu: ");
+  log.print(stringName);
+  log.print(" | aktivni LED: ");
+  log.print("LED");
+  log.print(getServoChannelForCurrentString());
+  log.print(" | cil: ");
+  log.print(targetFrequency, 2);
+  log.print(" Hz | freq: ");
+  log.print(measuredFrequency, 2);
+  log.print(" Hz | raw: ");
+  log.print(estimate.rawPeakFrequencyHz, 2);
+  log.print(" Hz | mag: ");
+  log.print(estimate.magnitude, 1);
+  log.print(" | rms: ");
+  log.print(estimate.signalRms, 1);
+  log.print(" | p2p: ");
+  log.print(estimate.peakToPeak, 1);
+  log.print(" (");
+  log.print(getTuningDirection(targetFrequency, measuredFrequency));
+  log.println(")");
 }
 
-void printWeakSignalStatus(const char *stringName, float targetFrequency, int signalAmplitude)
+void printWeakSignalStatus(const char *stringName,
+                           float targetFrequency,
+                           const TimeFrequencyTracker::Estimate &estimate)
 {
-  Serial.print("Ladim strunu: ");
-  Serial.print(stringName);
-  Serial.print(" | aktivni LED: ");
-  Serial.print("LED");
-  Serial.print(getServoChannelForCurrentString());
-  Serial.print(" | cil: ");
-  Serial.print(targetFrequency, 2);
-  Serial.print(" Hz | A: ");
-  Serial.print(signalAmplitude);
-  Serial.print(" | minimum: ");
-  Serial.print(MIN_SIGNAL_AMPLITUDE);
-  Serial.println(" | signal slaby");
+  auto &log = LogMirror::out();
+  log.print("Ladim strunu: ");
+  log.print(stringName);
+  log.print(" | aktivni LED: ");
+  log.print("LED");
+  log.print(getServoChannelForCurrentString());
+  log.print(" | cil: ");
+  log.print(targetFrequency, 2);
+  log.print(" Hz | raw: ");
+  log.print(estimate.rawPeakFrequencyHz, 2);
+  log.print(" Hz | rms: ");
+  log.print(estimate.signalRms, 1);
+  log.print(" | p2p: ");
+  log.print(estimate.peakToPeak, 1);
+  log.print(" | minimum rms/p2p: ");
+  log.print(TRACKER_MIN_SIGNAL_RMS, 1);
+  log.print("/");
+  log.print(TRACKER_MIN_PEAK_TO_PEAK, 1);
+  log.println(" | signal slaby");
 }
 
-void printNoFrequencyStatus(const char *stringName, float targetFrequency, int signalAmplitude)
+void printNoFrequencyStatus(const char *stringName, float targetFrequency)
 {
-  Serial.print("Ladim strunu: ");
-  Serial.print(stringName);
-  Serial.print(" | aktivni LED: ");
-  Serial.print("LED");
-  Serial.print(getServoChannelForCurrentString());
-  Serial.print(" | cil: ");
-  Serial.print(targetFrequency, 2);
-  Serial.print(" Hz | A: ");
-  Serial.print(signalAmplitude);
-  Serial.println(" | frekvence nenalezena");
+  auto &log = LogMirror::out();
+  log.print("Ladim strunu: ");
+  log.print(stringName);
+  log.print(" | aktivni LED: ");
+  log.print("LED");
+  log.print(getServoChannelForCurrentString());
+  log.print(" | cil: ");
+  log.print(targetFrequency, 2);
+  log.println(" Hz | frekvence zatim neni k dispozici");
 }
 
 void processCurrentString()
 {
   serviceServoMotion();
+  serviceFrequencyTracker();
 
-  if (currentStringIndex >= static_cast<int>(sizeof(STRING_FREQUENCIES) / sizeof(STRING_FREQUENCIES[0])))
+  if (currentStringIndex >= static_cast<int>(STRING_COUNT))
   {
-    Serial.println("Hotovo! Vsechny struny jsou naladene.");
-    tuningActive = false;
+    LogMirror::out().println("Hotovo! Vsechny struny jsou naladene.");
+    stopAllServos();
+    DisplayComm::setVisible("stop", 0);
+    tunerState = TunerState::Finished;
+    pendingFinishedReport = true;
+    WifiControl::enable();
     return;
   }
 
   if (servoPulseActive || millis() < nextMeasurementAllowedAtMs)
   {
-    delay(READ_DELAY_MS);
     return;
   }
 
-  const float targetFrequency = STRING_FREQUENCIES[currentStringIndex];
-  const char note = STRING_NOTES[currentStringIndex];
+  const float targetFrequency = STRINGS[currentStringIndex].desiredHz;
+  const char note = STRINGS[currentStringIndex].note;
 
-  double measuredFrequency = 0.0;
-  int signalAmplitude = 0;
-
-  if (!findDominantFrequency(targetFrequency, measuredFrequency, signalAmplitude))
+  if (!ensureFrequencyTrackerReady())
   {
     stableCount = 0;
-    printNoFrequencyStatus(STRING_NAMES[currentStringIndex], targetFrequency, signalAmplitude);
+    printNoFrequencyStatus(STRINGS[currentStringIndex].name, targetFrequency);
     return;
   }
 
-  if (signalAmplitude < MIN_SIGNAL_AMPLITUDE)
+  TimeFrequencyTracker::Estimate estimate;
+  if (!takeLatestFrequencyEstimate(estimate))
+  {
+    return;
+  }
+
+  if (!estimate.valid)
   {
     stableCount = 0;
     disableServoChannel(getServoChannelForCurrentString());
-    printWeakSignalStatus(STRING_NAMES[currentStringIndex], targetFrequency, signalAmplitude);
+    printWeakSignalStatus(STRINGS[currentStringIndex].name, targetFrequency, estimate);
     return;
   }
 
-  if (tuningActive && millis() - lastDisplayUpdateMs >= 120)
+  const float measuredFrequency = estimate.estimatedFrequencyHz;
+
+  results[currentStringIndex].tunedHz = measuredFrequency;
+  results[currentStringIndex].hasMeasurement = true;
+
+  if (tunerState == TunerState::Tuning && millis() - lastDisplayUpdateMs >= 120)
   {
-    updateDisplay(note, targetFrequency, static_cast<float>(measuredFrequency));
+    updateDisplay(note, targetFrequency, measuredFrequency);
     lastDisplayUpdateMs = millis();
   }
 
-  printTuningStatus(STRING_NAMES[currentStringIndex], targetFrequency, static_cast<float>(measuredFrequency), signalAmplitude);
+  printTuningStatus(STRINGS[currentStringIndex].name, targetFrequency, measuredFrequency, estimate);
 
   const float coarseLower = targetFrequency * (1.0f - COARSE_TOLERANCE);
   const float coarseUpper = targetFrequency * (1.0f + COARSE_TOLERANCE);
@@ -641,47 +658,99 @@ void processCurrentString()
   {
     disableServoChannel(getServoChannelForCurrentString());
     ++stableCount;
-    Serial.print("Stabilni: ");
-    Serial.print(stableCount);
-    Serial.print("/");
-    Serial.println(REQUIRED_STABLE_READS);
+    auto &log = LogMirror::out();
+    log.print("Stabilni: ");
+    log.print(stableCount);
+    log.print("/");
+    log.println(REQUIRED_STABLE_READS);
 
     if (stableCount >= REQUIRED_STABLE_READS)
     {
       const uint8_t finishedServoChannel = getServoChannelForCurrentString();
-      Serial.print("NALAZENO: ");
-      Serial.println(STRING_NAMES[currentStringIndex]);
+      log.print("NALAZENO: ");
+      log.println(STRINGS[currentStringIndex].name);
       disableServoChannel(finishedServoChannel);
       ++currentStringIndex;
       stableCount = 0;
-      waveformIndex = 0;
-      if (tuningActive)
+      trackerConfigured = false;
+      trackerConfiguredStringIndex = -1;
+      resetFrequencyTracker();
+      nextMeasurementAllowedAtMs = millis() + POST_STRING_DELAY_MS;
+      if (tunerState == TunerState::Tuning)
       {
-        clearWaveform();
+        DisplayComm::resetWaveform();
       }
-      delay(POST_STRING_DELAY_MS);
     }
   }
   else
   {
     stableCount = 0;
-    if (commandServoStepFromError(targetFrequency, static_cast<float>(measuredFrequency)))
+    if (commandServoStepFromError(targetFrequency, measuredFrequency))
     {
-      Serial.print("Servo krok pro ");
-      Serial.print(STRING_NAMES[currentStringIndex]);
-      Serial.print(" | chyba: ");
-      Serial.print(static_cast<float>(measuredFrequency) - targetFrequency, 2);
-      Serial.println(" Hz");
+      auto &log = LogMirror::out();
+      log.print("Servo krok pro ");
+      log.print(STRINGS[currentStringIndex].name);
+      log.print(" | chyba: ");
+      log.print(measuredFrequency - targetFrequency, 2);
+      log.println(" Hz");
     }
   }
-
-  delay(READ_DELAY_MS);
 }
 
 void setup()
 {
   Serial.begin(115200);
-  Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  LogMirror::begin(Serial);
+
+  DisplayComm::setConfig(DisplayComm::Config{});
+  DisplayComm::setCallbacks(DisplayComm::Callbacks{
+      []() { requestStartTuning(); },
+      []() {
+        LogMirror::out().println("Prijat prikaz STOP.");
+        abortTuning(true);
+      },
+  });
+  DisplayComm::begin(Serial2, 9600, RXD2, TXD2);
+
+  OtaTelnet::setCallbacks(OtaTelnet::Callbacks{
+      []() { return requestStartTuning(); },
+      []() {
+        abortTuning(true);
+      },
+      []() {
+        String status;
+        status += String("state: ");
+        switch (tunerState)
+        {
+        case TunerState::Idle:
+          status += "IDLE";
+          break;
+        case TunerState::Preparing:
+          status += "PREPARING";
+          break;
+        case TunerState::Tuning:
+          status += "TUNING";
+          break;
+        case TunerState::Finished:
+          status += "FINISHED";
+          break;
+        }
+        status += "\n";
+        status += String("wifiRadio: ") + (WifiControl::isEnabled() ? "on" : "off") + "\n";
+        status += String("pausedByStop: ") + (pausedByStop ? "true" : "false") + "\n";
+        status += String("currentStringIndex: ") + currentStringIndex;
+        status += "\n";
+        status += String("filters: ") + (filtersEnabled ? "on" : "off");
+        return status;
+      },
+      [](bool enabled) {
+        filtersEnabled = enabled;
+        LogMirror::out().println(String("Filters: ") + (filtersEnabled ? "ON" : "OFF"));
+      },
+      []() { return filtersEnabled; },
+  });
+  OtaTelnet::begin(WIFI_SSID, WIFI_PASS, OTA_HOSTNAME, OTA_PASSWORD, 3232, TELNET_PORT, TELNET_PASSWORD);
+
   Wire.begin(I2C_SDA, I2C_SCL);
 
   pwmDriver.begin();
@@ -690,33 +759,124 @@ void setup()
 
   analogReadResolution(12);
 
-  Serial.println("Auto tuner startuje...");
-  resetTuningState();
-  tuningActive = true;
-  pausedByStop = false;
-  Serial.println("Start ladeni...");
+  LogMirror::out().println("Auto tuner startuje...");
+  resetUiToIdle();
 }
 
 void loop()
 {
-  handleDisplayCommands();
+  serviceBackground();
 
-  if (!tuningActive)
+  if (tunerState == TunerState::Idle)
   {
-    if (currentStringIndex >= static_cast<int>(sizeof(STRING_FREQUENCIES) / sizeof(STRING_FREQUENCIES[0])))
-    {
-      delay(100);
-      return;
-    }
-
-    if (pausedByStop)
-    {
-      delay(50);
-      return;
-    }
-
-    tuningActive = true;
+    delay(20);
+    return;
   }
 
-  processCurrentString();
+  if (tunerState == TunerState::Preparing)
+  {
+    if (!preparingInitialized)
+    {
+      preparingInitialized = true;
+      pausedByStop = false;
+      resetTuningState();
+      for (size_t i = 0; i < STRING_COUNT; ++i)
+      {
+        results[i] = {};
+        results[i].desiredHz = STRINGS[i].desiredHz;
+      }
+      DisplayComm::setVisible("stop", 1);
+      preparingStartedAtMs = millis();
+      LogMirror::out().println("Priprava ladeni...");
+      return;
+    }
+
+    if (millis() - preparingStartedAtMs < WIFI_OFF_DELAY_MS)
+    {
+      delay(10);
+      return;
+    }
+
+    WifiControl::disable();
+    tunerState = TunerState::Tuning;
+    lastDisplayUpdateMs = 0;
+    LogMirror::out().println("WiFi vypnuta, zacinam ladit...");
+    return;
+  }
+
+  if (tunerState == TunerState::Tuning)
+  {
+    if (WifiControl::isEnabled())
+    {
+      WifiControl::disable();
+    }
+    processCurrentString();
+    return;
+  }
+
+  if (tunerState == TunerState::Finished)
+  {
+    if (pendingFinishedReport)
+    {
+      Print *telnet = OtaTelnet::console();
+      if (telnet)
+      {
+        telnet->println("STATUS: OK");
+        for (size_t i = 0; i < STRING_COUNT; ++i)
+        {
+          telnet->print("String ");
+          telnet->print(STRINGS[i].note);
+          telnet->print(": desired ");
+          telnet->print(results[i].desiredHz, 1);
+          telnet->print(" Hz, tuned ");
+          if (results[i].hasMeasurement)
+          {
+            telnet->print(results[i].tunedHz, 1);
+            telnet->println(" Hz");
+          }
+          else
+          {
+            telnet->println("N/A");
+          }
+        }
+        pendingFinishedReport = false;
+        tunerState = TunerState::Idle;
+        resetUiToIdle();
+      }
+    }
+    delay(50);
+    return;
+  }
+}
+
+bool requestStartTuning()
+{
+  if (tunerState == TunerState::Preparing || tunerState == TunerState::Tuning)
+  {
+    return false;
+  }
+
+  preparingInitialized = false;
+  pendingFinishedReport = false;
+  tunerState = TunerState::Preparing;
+  return true;
+}
+
+void abortTuning(bool byStop)
+{
+  pausedByStop = byStop;
+  pendingFinishedReport = false;
+  tunerState = TunerState::Idle;
+  preparingInitialized = false;
+  resetTuningState();
+  WifiControl::enable();
+  resetUiToIdle();
+}
+
+void resetUiToIdle()
+{
+  DisplayComm::setVisible("stop", 0);
+  DisplayComm::writeText("Note", "-");
+  DisplayComm::writeNumber("desiredf", 0);
+  DisplayComm::writeNumber("currentf", 0);
 }
