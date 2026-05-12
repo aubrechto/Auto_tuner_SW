@@ -1,5 +1,8 @@
 #pragma once
 
+// Unused legacy analyzer kept for reference; the current firmware uses TimeFrequencyTracker::GoertzelSweepTracker.
+#if 0
+
 #include <Arduino.h>
 #include <functional>
 
@@ -22,3 +25,5 @@ bool findDominantFrequency(uint8_t adcPin,
                            const std::function<void()> &pump,
                            const std::function<bool()> &isActive);
 } // namespace FftAnalyzer
+
+#endif

@@ -1,0 +1,449 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[czech]{babel}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{red!60!black},
+    numbers=left,
+    numberstyle=\tiny,
+    stepnumber=1,
+    numbersep=8pt,
+    frame=single,
+    breaklines=true,
+    tabsize=2
+}
+
+\begin{document}
+
+\section{Stavový automat automatické ladičky}
+
+Program automatické ladičky používá čtyři hlavní stavy. Ty určují, jestli zařízení čeká na spuštění, připravuje ladění, aktivně ladí struny, nebo dokončuje celý proces a vrací se zpět do klidu.
+
+\begin{lstlisting}[caption={Definice stavů v programu},label=list:stavy-definice,captionpos=t,abovecaptionskip=-\medskipamount,belowcaptionskip=\medskipamount,language=C]
+enum class TunerState : uint8_t
+{
+  Idle,
+  Preparing,
+  Tuning,
+  Finished,
+};
+\end{lstlisting}
+
+V hlavní smyčce se před zpracováním jednotlivých stavů vždy volá \texttt{serviceBackground()}, která průběžně obsluhuje displej, telnet, logování a sériovou konzoli.
+
+\begin{lstlisting}[caption={Funkce serviceBackground vytažená ze zdrojového kódu},label=list:service-background,captionpos=t,abovecaptionskip=-\medskipamount,belowcaptionskip=\medskipamount,language=C]
+void serviceBackground()
+{
+  DisplayComm::poll();
+  OtaTelnet::loop();
+  LogMirror::setMirror(OtaTelnet::console());
+  pollConsoleCommands();
+}
+\end{lstlisting}
+
+\begin{itemize}
+  \item \texttt{DisplayComm::poll()} průběžně zpracovává komunikaci a události z displeje.
+  \item \texttt{OtaTelnet::loop()} obsluhuje OTA a telnet komunikaci.
+  \item \texttt{LogMirror::setMirror()} nastavuje, kam se mají zrcadlit logovací výpisy.
+  \item \texttt{OtaTelnet::console()} vrací aktivní telnet konzoli, pokud je připojená.
+  \item \texttt{pollConsoleCommands()} čte a zpracovává příkazy ze sériové konzole.
+\end{itemize}
+
+\section{Stav Idle}
+
+Stav \texttt{Idle} je klidový stav, ve kterém ladička neprovádí měření ani nepohybuje servy. Zařízení čeká na příkaz START a pouze aktualizuje systémové indikátory, například baterii, nabíjení a ikonu Wi-Fi.
+
+\subsection{Jak se do stavu Idle dostat}
+
+Do stavu \texttt{Idle} se program dostane hned při inicializaci globální proměnné, po dokončení ladění nebo při zastavení ladění funkcí \texttt{abortTuning()}.
+
+\begin{lstlisting}[caption={Inicializace stavu Idle ve zdrojovém kódu},label=list:idle-init,captionpos=t,abovecaptionskip=-\medskipamount,belowcaptionskip=\medskipamount,language=C]
+TunerState tunerState = TunerState::Idle;
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Návrat do stavu Idle při zastavení ladění},label=list:idle-abort,captionpos=t,abovecaptionskip=-\medskipamount,belowcaptionskip=\medskipamount,language=C]
+void abortTuning(bool byStop)
+{
+  pausedByStop = byStop;
+  pendingFinishedReport = false;
+  tunerState = TunerState::Idle;
+  preparingInitialized = false;
+  resetTuningState();
+  WifiControl::enable();
+  resetUiToIdle();
+}
+\end{lstlisting}
+
+\subsection{Jaké funkce se ve stavu Idle skrývají}
+
+Ve stavu \texttt{Idle} se kromě společné obsluhy na pozadí volají pouze funkce pro aktualizaci systémových indikátorů a krátké zpomalení smyčky.
+
+\begin{lstlisting}[caption={Obsluha stavu Idle vytažená z funkce loop},label=list:idle-loop,captionpos=t,abovecaptionskip=-\medskipamount,belowcaptionskip=\medskipamount,language=C]
+  if (tunerState == TunerState::Idle)
+  {
+    updateSystemStatusIndicators();
+    delay(20);
+    return;
+  }
+\end{lstlisting}
+
+\begin{itemize}
+  \item \texttt{abortTuning()} ukončí právě probíhající ladění a vrátí program do klidového stavu.
+  \item \texttt{resetTuningState()} vynuluje ladicí proměnné, zastaví serva, resetuje měření a připraví první strunu.
+  \item \texttt{WifiControl::enable()} zapne Wi-Fi rádio.
+  \item \texttt{resetUiToIdle()} nastaví displej zpět do klidového zobrazení.
+  \item \texttt{updateSystemStatusIndicators()} aktualizuje na displeji stav baterie, nabíjení a Wi-Fi.
+  \item \texttt{delay(20)} krátce zpomalí hlavní smyčku, aby neběžela zbytečně naplno.
+\end{itemize}
+
+\section{Stav Preparing}
+
+Stav \texttt{Preparing} připravuje zařízení na ladění. Program vynuluje předchozí měření, nastaví první strunu, připraví pole výsledků, zobrazí tlačítko STOP a po krátké prodlevě vypne Wi-Fi rádio, aby nerušilo měření.
+
+\subsection{Jak se do stavu Preparing dostat}
+
+Do stavu \texttt{Preparing} se program dostane po přijetí příkazu START z displeje nebo telnetu. Tento přechod zajišťuje funkce \texttt{requestStartTuning()}.
+
+\begin{lstlisting}[caption={Přechod do stavu Preparing vytažený ze zdrojového kódu},label=list:preparing-start,captionpos=t,abovecaptionskip=-\medskipamount,belowcaptionskip=\medskipamount,language=C]
+bool requestStartTuning()
+{
+  if (tunerState == TunerState::Preparing || tunerState == TunerState::Tuning)
+  {
+    return false;
+  }
+
+  preparingInitialized = false;
+  pendingFinishedReport = false;
+  tunerState = TunerState::Preparing;
+  return true;
+}
+\end{lstlisting}
+
+\subsection{Jaké funkce se ve stavu Preparing skrývají}
+
+Ve stavu \texttt{Preparing} je nejdříve jednorázová inicializace ladění, poté krátké čekání a nakonec vypnutí Wi-Fi a přechod do stavu \texttt{Tuning}.
+
+\begin{lstlisting}[caption={Obsluha stavu Preparing vytažená z funkce loop},label=list:preparing-loop,captionpos=t,abovecaptionskip=-\medskipamount,belowcaptionskip=\medskipamount,language=C]
+  if (tunerState == TunerState::Preparing)
+  {
+    if (!preparingInitialized)
+    {
+      preparingInitialized = true;
+      pausedByStop = false;
+      resetTuningState();
+      for (size_t i = 0; i < STRING_COUNT; ++i)
+      {
+        results[i] = {};
+        results[i].desiredHz = STRINGS[i].desiredHz;
+      }
+      DisplayComm::setVisible("stop", 1);
+      preparingStartedAtMs = millis();
+      LogMirror::out().println("Priprava ladeni...");
+      updateSystemStatusIndicators();
+      return;
+    }
+
+    if (millis() - preparingStartedAtMs < WIFI_OFF_DELAY_MS)
+    {
+      updateSystemStatusIndicators();
+      delay(10);
+      return;
+    }
+
+    WifiControl::disable();
+    tunerState = TunerState::Tuning;
+    lastDisplayUpdateMs = 0;
+    LogMirror::out().println("WiFi vypnuta, zacinam ladit...");
+    updateSystemStatusIndicators();
+    return;
+  }
+\end{lstlisting}
+
+\begin{itemize}
+  \item \texttt{requestStartTuning()} zkontroluje, jestli ladění neběží, a spustí přechod do přípravného stavu.
+  \item \texttt{resetTuningState()} vynuluje ladicí proměnné, zastaví serva, resetuje měření a připraví první strunu.
+  \item \texttt{DisplayComm::setVisible("stop", 1)} zobrazí na displeji tlačítko STOP.
+  \item \texttt{millis()} vrací aktuální čas běhu programu a používá se pro měření přípravné prodlevy.
+  \item \texttt{LogMirror::out()} vrací výstupní logovací stream.
+  \item \texttt{updateSystemStatusIndicators()} aktualizuje systémové indikátory na displeji.
+  \item \texttt{delay(10)} krátce zpomalí smyčku během čekání na vypnutí Wi-Fi.
+  \item \texttt{WifiControl::disable()} vypne Wi-Fi rádio před začátkem měření.
+\end{itemize}
+
+\section{Stav Tuning}
+
+Stav \texttt{Tuning} je hlavní pracovní stav ladičky. Program měří frekvenci aktuální struny, porovnává ji s cílovou frekvencí a podle odchylky ovládá servo, které danou strunu dolaďuje.
+
+\subsection{Jak se do stavu Tuning dostat}
+
+Do stavu \texttt{Tuning} se program dostane ze stavu \texttt{Preparing}, jakmile uběhne přípravná prodleva a Wi-Fi rádio se vypne.
+
+\begin{lstlisting}[caption={Přechod do stavu Tuning vytažený ze zdrojového kódu},label=list:tuning-start,captionpos=t,abovecaptionskip=-\medskipamount,belowcaptionskip=\medskipamount,language=C]
+    WifiControl::disable();
+    tunerState = TunerState::Tuning;
+    lastDisplayUpdateMs = 0;
+    LogMirror::out().println("WiFi vypnuta, zacinam ladit...");
+    updateSystemStatusIndicators();
+    return;
+\end{lstlisting}
+
+\subsection{Jaké funkce se ve stavu Tuning skrývají}
+
+Ve stavu \texttt{Tuning} se hlídá, aby Wi-Fi zůstala vypnutá, následně se zavolá funkce \texttt{processCurrentString()}, ve které je ukryté celé měření a ladění aktuální struny.
+
+\begin{lstlisting}[caption={Obsluha stavu Tuning vytažená z funkce loop},label=list:tuning-loop,captionpos=t,abovecaptionskip=-\medskipamount,belowcaptionskip=\medskipamount,language=C]
+  if (tunerState == TunerState::Tuning)
+  {
+    if (WifiControl::isEnabled())
+    {
+      WifiControl::disable();
+    }
+    processCurrentString();
+    updateSystemStatusIndicators();
+    return;
+  }
+\end{lstlisting}
+
+\begin{itemize}
+  \item \texttt{WifiControl::isEnabled()} zkontroluje, jestli je Wi-Fi rádio zapnuté.
+  \item \texttt{WifiControl::disable()} vypne Wi-Fi rádio, pokud je během ladění zapnuté.
+  \item \texttt{processCurrentString()} provede měření, vyhodnocení a případný pohyb servem pro aktuální strunu.
+  \item \texttt{updateSystemStatusIndicators()} aktualizuje systémové indikátory na displeji.
+\end{itemize}
+
+Následující výpis je skutečná funkce \texttt{processCurrentString()} vytažená ze zdrojového kódu.
+
+\begin{lstlisting}[caption={Funkce processCurrentString vytažená ze zdrojového kódu},label=list:process-current-string,captionpos=t,abovecaptionskip=-\medskipamount,belowcaptionskip=\medskipamount,language=C]
+void processCurrentString()
+{
+  serviceServoMotion();
+  serviceFrequencyTracker();
+
+  if (currentStringIndex >= static_cast<int>(STRING_COUNT))
+  {
+    LogMirror::out().println("Hotovo! Vsechny struny jsou naladene.");
+    stopAllServos();
+    DisplayComm::setVisible("stop", 0);
+    tunerState = TunerState::Finished;
+    pendingFinishedReport = true;
+    WifiControl::enable();
+    return;
+  }
+
+  if (servoPulseActive || millis() < nextMeasurementAllowedAtMs)
+  {
+    return;
+  }
+
+  const float targetFrequency = STRINGS[currentStringIndex].desiredHz;
+  const char note = STRINGS[currentStringIndex].note;
+
+  if (lastDisplayedDispBco == DISPLAY_TUNED_BCO)
+  {
+    setTunedDisplayHighlight(false);
+  }
+
+  if (!ensureFrequencyTrackerReady())
+  {
+    stableCount = 0;
+    printNoFrequencyStatus(STRINGS[currentStringIndex].name, targetFrequency);
+    return;
+  }
+
+  TimeFrequencyTracker::Estimate estimate;
+  if (!takeLatestFrequencyEstimate(estimate))
+  {
+    return;
+  }
+
+  if (!estimate.valid)
+  {
+    stableCount = 0;
+    resetMeasurementAccumulator();
+    disableServoChannel(getServoChannelForCurrentString());
+    printWeakSignalStatus(STRINGS[currentStringIndex].name, targetFrequency, estimate);
+    return;
+  }
+
+  TimeFrequencyTracker::Estimate averagedEstimate;
+  if (!takeAveragedFrequencyEstimate(estimate, averagedEstimate))
+  {
+    return;
+  }
+
+  const float measuredFrequency = averagedEstimate.estimatedFrequencyHz;
+
+  results[currentStringIndex].tunedHz = measuredFrequency;
+  results[currentStringIndex].hasMeasurement = true;
+
+  if (tunerState == TunerState::Tuning && millis() - lastDisplayUpdateMs >= 120)
+  {
+    updateDisplay(note, targetFrequency, measuredFrequency);
+    lastDisplayUpdateMs = millis();
+  }
+
+  printTuningStatus(STRINGS[currentStringIndex].name, targetFrequency, measuredFrequency, averagedEstimate);
+
+  const float coarseLower = targetFrequency * (1.0f - COARSE_TOLERANCE);
+  const float coarseUpper = targetFrequency * (1.0f + COARSE_TOLERANCE);
+  const float fineLower = targetFrequency - FINE_TOLERANCE_HZ;
+  const float fineUpper = targetFrequency + FINE_TOLERANCE_HZ;
+  const bool withinFineRange = measuredFrequency >= fineLower && measuredFrequency <= fineUpper;
+
+  if (measuredFrequency >= coarseLower && measuredFrequency <= coarseUpper &&
+      withinFineRange)
+  {
+    disableServoChannel(getServoChannelForCurrentString());
+    ++stableCount;
+    auto &log = LogMirror::out();
+    log.print("Stabilni: ");
+    log.print(stableCount);
+    log.print("/");
+    log.println(REQUIRED_STABLE_READS);
+
+    if (stableCount >= REQUIRED_STABLE_READS)
+    {
+      const uint8_t finishedServoChannel = getServoChannelForCurrentString();
+      log.print("NALAZENO: ");
+      log.println(STRINGS[currentStringIndex].name);
+      disableServoChannel(finishedServoChannel);
+      setTunedDisplayHighlight(true);
+      ++currentStringIndex;
+      stableCount = 0;
+      trackerConfigured = false;
+      trackerConfiguredStringIndex = -1;
+      resetMeasurementAccumulator();
+      resetFrequencyTracker();
+      nextMeasurementAllowedAtMs = millis() + POST_STRING_DELAY_MS;
+      if (tunerState == TunerState::Tuning)
+      {
+        DisplayComm::resetWaveform();
+      }
+    }
+  }
+  else
+  {
+    stableCount = 0;
+    if (commandServoStepFromError(targetFrequency, measuredFrequency))
+    {
+      auto &log = LogMirror::out();
+      log.print("Servo krok pro ");
+      log.print(STRINGS[currentStringIndex].name);
+      log.print(" | chyba: ");
+      log.print(measuredFrequency - targetFrequency, 2);
+      log.println(" Hz");
+    }
+  }
+}
+\end{lstlisting}
+
+\begin{itemize}
+  \item \texttt{processCurrentString()} provede měření, vyhodnocení a případný pohyb servem pro aktuální strunu.
+  \item \texttt{serviceServoMotion()} hlídá doběh pulzu serva a po jeho skončení servo vypne.
+  \item \texttt{serviceFrequencyTracker()} čte vzorky z ADC a předává je frekvenčnímu trackeru.
+  \item \texttt{LogMirror::out()} vrací výstupní logovací stream pro textové zprávy.
+  \item \texttt{ensureFrequencyTrackerReady()} ověří nebo nastaví frekvenční tracker pro aktuální strunu.
+  \item \texttt{takeLatestFrequencyEstimate()} získá poslední nově vypočítaný odhad frekvence.
+  \item \texttt{takeAveragedFrequencyEstimate()} zprůměruje naměřené hodnoty frekvence.
+  \item \texttt{updateDisplay()} zobrazí aktuální notu, cílovou frekvenci a měřenou frekvenci.
+  \item \texttt{printTuningStatus()} vypíše do logu aktuální stav ladění.
+  \item \texttt{printWeakSignalStatus()} vypíše do logu informaci, že vstupní signál je příliš slabý.
+  \item \texttt{printNoFrequencyStatus()} vypíše do logu, že frekvence zatím není dostupná.
+  \item \texttt{commandServoStepFromError()} podle odchylky frekvence rozhodne o kroku serva.
+  \item \texttt{disableServoChannel()} vypne konkrétní servo kanál.
+  \item \texttt{setTunedDisplayHighlight()} zvýrazní displej, když je struna naladěná.
+  \item \texttt{resetMeasurementAccumulator()} smaže hodnoty používané pro průměrování měření.
+  \item \texttt{resetFrequencyTracker()} resetuje frekvenční tracker pro další čisté měření.
+  \item \texttt{millis()} vrací aktuální čas běhu programu a používá se pro časování měření a prodlev.
+  \item \texttt{DisplayComm::resetWaveform()} smaže nebo resetuje zobrazenou vlnu na displeji.
+  \item \texttt{DisplayComm::setVisible("stop", 0)} schová na displeji tlačítko STOP.
+  \item \texttt{stopAllServos()} vypne všechna serva.
+  \item \texttt{WifiControl::enable()} znovu zapne Wi-Fi po dokončení ladění.
+\end{itemize}
+
+\section{Stav Finished}
+
+Stav \texttt{Finished} nastane po naladění všech strun. Program v něm dokončí ladění, zastaví serva, zapne Wi-Fi, odešle výsledný report přes telnet a potom se vrátí zpět do stavu \texttt{Idle}.
+
+\subsection{Jak se do stavu Finished dostat}
+
+Do stavu \texttt{Finished} se program dostane uvnitř funkce \texttt{processCurrentString()}, když je index aktuální struny větší nebo roven počtu všech strun.
+
+\begin{lstlisting}[caption={Přechod do stavu Finished vytažený ze zdrojového kódu},label=list:finished-start,captionpos=t,abovecaptionskip=-\medskipamount,belowcaptionskip=\medskipamount,language=C]
+  if (currentStringIndex >= static_cast<int>(STRING_COUNT))
+  {
+    LogMirror::out().println("Hotovo! Vsechny struny jsou naladene.");
+    stopAllServos();
+    DisplayComm::setVisible("stop", 0);
+    tunerState = TunerState::Finished;
+    pendingFinishedReport = true;
+    WifiControl::enable();
+    return;
+  }
+\end{lstlisting}
+
+\subsection{Jaké funkce se ve stavu Finished skrývají}
+
+Ve stavu \texttt{Finished} se odešle report s výsledky všech strun, vypne se příznak čekajícího reportu, stav se přepne zpět na \texttt{Idle} a displej se vrátí do klidového zobrazení.
+
+\begin{lstlisting}[caption={Obsluha stavu Finished vytažená z funkce loop},label=list:finished-loop,captionpos=t,abovecaptionskip=-\medskipamount,belowcaptionskip=\medskipamount,language=C]
+  if (tunerState == TunerState::Finished)
+  {
+    if (pendingFinishedReport)
+    {
+      Print *telnet = OtaTelnet::console();
+      if (telnet)
+      {
+        telnet->println("STATUS: OK");
+        for (size_t i = 0; i < STRING_COUNT; ++i)
+        {
+          telnet->print("String ");
+          telnet->print(STRINGS[i].note);
+          telnet->print(": desired ");
+          telnet->print(results[i].desiredHz, 1);
+          telnet->print(" Hz, tuned ");
+          if (results[i].hasMeasurement)
+          {
+            telnet->print(results[i].tunedHz, 1);
+            telnet->println(" Hz");
+          }
+          else
+          {
+            telnet->println("N/A");
+          }
+        }
+        pendingFinishedReport = false;
+        tunerState = TunerState::Idle;
+        resetUiToIdle();
+      }
+    }
+    updateSystemStatusIndicators();
+    delay(50);
+    return;
+  }
+\end{lstlisting}
+
+\begin{itemize}
+  \item \texttt{stopAllServos()} vypne všechna serva po dokončení poslední struny.
+  \item \texttt{DisplayComm::setVisible("stop", 0)} schová na displeji tlačítko STOP.
+  \item \texttt{WifiControl::enable()} znovu zapne Wi-Fi rádio.
+  \item \texttt{telnet->println()} odešle celý řádek textu do telnet konzole.
+  \item \texttt{telnet->print()} odešle text nebo hodnotu do telnet konzole bez automatického odřádkování.
+  \item \texttt{OtaTelnet::console()} vrátí telnet konzoli, přes kterou se odešle výsledný report.
+  \item \texttt{resetUiToIdle()} nastaví displej zpět do klidového stavu.
+  \item \texttt{updateSystemStatusIndicators()} aktualizuje systémové indikátory na displeji.
+  \item \texttt{delay(50)} krátce zpomalí smyčku v dokončovacím stavu.
+\end{itemize}
+
+\section{Shrnutí}
+
+Celý průběh je lineární: program čeká ve stavu \texttt{Idle}, po STARTu přejde do \texttt{Preparing}, poté aktivně ladí ve stavu \texttt{Tuning}, po naladění všech strun přejde do \texttt{Finished} a nakonec se vrátí zpět do \texttt{Idle}.
+
+\end{document}

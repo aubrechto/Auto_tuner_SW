@@ -1,3 +1,6 @@
+// Unused legacy detector kept for reference; the current firmware uses TimeFrequencyTracker::GoertzelSweepTracker.
+#if 0
+
 #include "GoertzelDetector.h"
 
 #include <math.h>
@@ -119,3 +122,5 @@ float goertzel_detect(const float *samples,
   return (mag2 >= 0.0f) ? mag2 : 0.0f;
 }
 } // namespace GoertzelDetector
+
+#endif

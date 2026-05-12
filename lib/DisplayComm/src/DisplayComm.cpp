@@ -80,8 +80,9 @@ bool poll()
   const String command = displaySerial->readStringUntil('\n');
   String normalized = command;
   normalized.trim();
+  normalized.toUpperCase();
 
-  if (normalized == "PLAY")
+  if (normalized == "PLAY" || normalized == "START")
   {
     if (callbacks.onPlay)
     {
@@ -145,6 +146,20 @@ void writeNumber(const String &object, int value)
   endCommand();
 }
 
+void writeAttributeNumber(const String &object, const String &attribute, int value)
+{
+  if (!displaySerial)
+  {
+    return;
+  }
+  displaySerial->print(object);
+  displaySerial->print(".");
+  displaySerial->print(attribute);
+  displaySerial->print("=");
+  displaySerial->print(value);
+  endCommand();
+}
+
 void setVisible(const String &object, bool visible)
 {
   if (!displaySerial)
@@ -197,4 +212,3 @@ void updateDisplay(char note, float targetFrequency, float measuredFrequency)
   sendWaveformChunk(note, measuredFrequency, 10);
 }
 } // namespace DisplayComm
-

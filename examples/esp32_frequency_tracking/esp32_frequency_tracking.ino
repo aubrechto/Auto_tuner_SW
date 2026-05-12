@@ -9,9 +9,8 @@ constexpr float SAMPLE_RATE_HZ = 4000.0f;
 constexpr uint32_t SAMPLE_PERIOD_US = static_cast<uint32_t>(1000000.0f / SAMPLE_RATE_HZ);
 
 TimeFrequencyTracker::GoertzelSweepTracker goertzelTracker;
-TimeFrequencyTracker::SlidingFftTracker fftTracker;
-
-bool useGoertzel = true;
+// Unused FFT tracker example path kept commented out with the disabled SlidingFftTracker implementation.
+// TimeFrequencyTracker::SlidingFftTracker fftTracker;
 uint32_t nextSampleAtUs = 0;
 }
 
@@ -32,16 +31,8 @@ void setup()
   config.emaAlpha = 0.90f;
   config.minSignalRms = 12.0f;
 
-  if (useGoertzel)
-  {
-    goertzelTracker.begin(config);
-    Serial.println("tracker=goertzel");
-  }
-  else
-  {
-    fftTracker.begin(config);
-    Serial.println("tracker=fft");
-  }
+  goertzelTracker.begin(config);
+  Serial.println("tracker=goertzel");
 
   Serial.println("timestamp_ms,estimated_frequency_hz,magnitude,raw_peak_hz,signal_rms,valid");
   nextSampleAtUs = micros();
@@ -59,9 +50,7 @@ void loop()
 
   const float sample = static_cast<float>(analogRead(ADC_PIN));
   TimeFrequencyTracker::Estimate estimate;
-  const bool ready = useGoertzel
-                         ? goertzelTracker.pushSample(sample, estimate)
-                         : fftTracker.pushSample(sample, estimate);
+  const bool ready = goertzelTracker.pushSample(sample, estimate);
 
   if (!ready)
   {

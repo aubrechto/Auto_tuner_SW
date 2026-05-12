@@ -15,7 +15,7 @@ struct Config
 
 struct Callbacks
 {
-  std::function<void()> onPlay;
+  std::function<bool()> onPlay;
   std::function<void()> onStop;
 };
 
@@ -30,9 +30,9 @@ void resetWaveform();
 
 void writeText(const String &object, const String &value);
 void writeNumber(const String &object, int value);
+void writeAttributeNumber(const String &object, const String &attribute, int value);
 void setVisible(const String &object, bool visible);
 
 void sendWaveformChunk(char note, float measuredFrequency, int chunkSize);
 void updateDisplay(char note, float targetFrequency, float measuredFrequency);
 } // namespace DisplayComm
-

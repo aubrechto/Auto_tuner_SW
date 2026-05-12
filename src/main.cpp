@@ -1,5 +1,6 @@
 #include <Arduino.h>
-#include <SPI.h>
+// Unused in the current firmware; kept commented in case SPI hardware is added later.
+// #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <math.h>
@@ -41,23 +42,28 @@ constexpr uint8_t TXD2 = 17;
 constexpr uint8_t ADC_PIN = 32;
 constexpr uint8_t I2C_SDA = 21;
 constexpr uint8_t I2C_SCL = 22;
+constexpr uint8_t BQ25895M_I2C_ADDRESS = 0x6A;
 
 constexpr uint16_t SERVO_CENTER = 375;
 constexpr uint16_t SERVO_MAX_OFFSET = 255;
-constexpr uint16_t SERVO_COARSE_OFFSET = 160;
-constexpr uint16_t SERVO_MEDIUM_OFFSET = 110;
-constexpr uint16_t SERVO_FINE_OFFSET = 70;
-constexpr unsigned long SERVO_COARSE_PULSE_MS = 220;
-constexpr unsigned long SERVO_MEDIUM_PULSE_MS = 140;
-constexpr unsigned long SERVO_FINE_PULSE_MS = 90;
+constexpr uint16_t SERVO_STEP_FINE_OFFSET = 25;
+constexpr unsigned long SERVO_STEP_FINE_PULSE_MS = 40;
+constexpr uint16_t SERVO_STEP_MEDIUM_OFFSET = 32;
+constexpr unsigned long SERVO_STEP_MEDIUM_PULSE_MS = 50;
+constexpr uint16_t SERVO_STEP_COARSE_OFFSET = 50;
+constexpr unsigned long SERVO_STEP_COARSE_PULSE_MS = 75;
+constexpr uint16_t SERVO_STEP_AGGRESSIVE_OFFSET = 72;
+constexpr unsigned long SERVO_STEP_AGGRESSIVE_PULSE_MS = 105;
+constexpr float SERVO_FINE_STEP_THRESHOLD_HZ = 2.0f;
+constexpr float SERVO_MEDIUM_STEP_THRESHOLD_HZ = 3.0f;
+constexpr float SERVO_COARSE_STEP_THRESHOLD_HZ = 6.0f;
 constexpr unsigned long SERVO_SETTLE_MS = 220;
-constexpr float SERVO_COARSE_ERROR_HZ = 2.5f;
-constexpr float SERVO_MEDIUM_ERROR_HZ = 0.8f;
 
-constexpr float COARSE_TOLERANCE = 0.50f;
-constexpr float FINE_TOLERANCE = 0.01f;
-constexpr uint8_t REQUIRED_STABLE_READS = 3;
-constexpr unsigned long POST_STRING_DELAY_MS = 250;
+constexpr float COARSE_TOLERANCE = 0.5f;
+constexpr float FINE_TOLERANCE_HZ = 0.5f;
+constexpr uint8_t REQUIRED_STABLE_READS = 1;
+constexpr uint8_t MEASUREMENT_AVERAGE_COUNT = 1;
+constexpr unsigned long POST_STRING_DELAY_MS = 1200;
 constexpr unsigned long WIFI_OFF_DELAY_MS = 150;
 
 constexpr float TRACKER_SAMPLE_RATE_HZ = 4000.0f;
@@ -79,6 +85,15 @@ constexpr float TRACKER_REJECT_CENTER_HZ = 100.0f;
 constexpr float TRACKER_REJECT_HALF_WIDTH_HZ = 4.0f;
 constexpr uint8_t TRACKER_MAX_SAMPLES_PER_SERVICE = 16;
 constexpr uint8_t TRACKER_MAX_TIMING_LAG_SAMPLES = 8;
+constexpr unsigned long SYSTEM_STATUS_UPDATE_MS = 15000;
+constexpr uint16_t DISPLAY_DEFAULT_BCO = 0;
+constexpr uint16_t DISPLAY_TUNED_BCO = 1024;
+constexpr uint8_t BQ25895M_REG_ADC_CONTROL = 0x02;
+constexpr uint8_t BQ25895M_REG_CHARGER_STATUS = 0x0B;
+constexpr uint8_t BQ25895M_REG_BATTERY_VOLTAGE = 0x0E;
+constexpr uint8_t BQ25895M_ADC_CONTINUOUS_MASK = 0x40;
+constexpr float BQ25895M_BATTERY_VOLTAGE_BASE_V = 2.304f;
+constexpr float BQ25895M_BATTERY_VOLTAGE_STEP_V = 0.020f;
 
 struct StringConfig
 {
@@ -105,6 +120,56 @@ struct StringTuningResult
   bool hasMeasurement = false;
 };
 
+struct MeasurementAccumulator
+{
+  float estimatedFrequencySum = 0.0f;
+  float rawPeakFrequencySum = 0.0f;
+  float magnitudeSum = 0.0f;
+  float scoreSum = 0.0f;
+  float signalRmsSum = 0.0f;
+  float peakToPeakSum = 0.0f;
+  uint8_t sampleCount = 0;
+};
+
+struct BatteryStatus
+{
+  bool available = false;
+  bool charging = false;
+  float voltageV = 0.0f;
+  int percent = 0;
+};
+
+struct BatteryPercentPoint
+{
+  float voltageV;
+  uint8_t percent;
+};
+
+// Approximate open-circuit state-of-charge curve for a 1S Li-ion / LiPo cell with 3.7V nominal voltage.
+constexpr BatteryPercentPoint BATTERY_PERCENT_CURVE[] = {
+    {4.20f, 100},
+    {4.15f, 95},
+    {4.11f, 90},
+    {4.08f, 85},
+    {4.02f, 80},
+    {3.98f, 75},
+    {3.95f, 70},
+    {3.91f, 65},
+    {3.87f, 60},
+    {3.85f, 55},
+    {3.84f, 50},
+    {3.82f, 45},
+    {3.80f, 40},
+    {3.79f, 35},
+    {3.77f, 30},
+    {3.75f, 25},
+    {3.73f, 20},
+    {3.71f, 15},
+    {3.69f, 10},
+    {3.61f, 5},
+    {3.27f, 0},
+};
+
 enum class TunerState : uint8_t
 {
   Idle,
@@ -126,6 +191,7 @@ uint8_t activeServoChannel = 0;
 unsigned long servoPulseStopAtMs = 0;
 unsigned long nextMeasurementAllowedAtMs = 0;
 bool filtersEnabled = true;
+bool measurementStatusLogsEnabled = true;
 unsigned long preparingStartedAtMs = 0;
 bool preparingInitialized = false;
 bool pendingFinishedReport = false;
@@ -137,6 +203,12 @@ uint32_t nextTrackerSampleAtUs = 0;
 uint32_t trackerEstimateSequence = 0;
 uint32_t consumedEstimateSequence = 0;
 TimeFrequencyTracker::Estimate latestTrackerEstimate{};
+MeasurementAccumulator measurementAccumulator{};
+unsigned long lastSystemStatusUpdateMs = 0;
+int lastDisplayedBatteryPercent = -1;
+int lastDisplayedChargingVisible = -1;
+int lastDisplayedWifiVisible = -1;
+int lastDisplayedDispBco = -1;
 
 namespace WifiControl
 {
@@ -150,6 +222,11 @@ bool ensureFrequencyTrackerReady();
 void resetFrequencyTracker(bool reconfigure = false);
 void serviceFrequencyTracker();
 bool takeLatestFrequencyEstimate(TimeFrequencyTracker::Estimate &estimate);
+void resetMeasurementAccumulator();
+bool takeAveragedFrequencyEstimate(const TimeFrequencyTracker::Estimate &estimate,
+                                   TimeFrequencyTracker::Estimate &averagedEstimate);
+void updateSystemStatusIndicators(bool force = false);
+void setTunedDisplayHighlight(bool enabled);
 } // namespace
 bool requestStartTuning();
 void abortTuning(bool byStop);
@@ -193,6 +270,26 @@ void handleConsoleCommand(String line)
   if (lower == "filters")
   {
     LogMirror::out().println(String("Filters: ") + (filtersEnabled ? "ON" : "OFF"));
+    return;
+  }
+
+  if (lower == "measurelogs on")
+  {
+    measurementStatusLogsEnabled = true;
+    LogMirror::out().println("Measure logs: ON");
+    return;
+  }
+
+  if (lower == "measurelogs off")
+  {
+    measurementStatusLogsEnabled = false;
+    LogMirror::out().println("Measure logs: OFF");
+    return;
+  }
+
+  if (lower == "measurelogs")
+  {
+    LogMirror::out().println(String("Measure logs: ") + (measurementStatusLogsEnabled ? "ON" : "OFF"));
     return;
   }
 }
@@ -383,6 +480,192 @@ bool takeLatestFrequencyEstimate(TimeFrequencyTracker::Estimate &estimate)
   consumedEstimateSequence = trackerEstimateSequence;
   return true;
 }
+
+void resetMeasurementAccumulator()
+{
+  measurementAccumulator = {};
+}
+
+bool takeAveragedFrequencyEstimate(const TimeFrequencyTracker::Estimate &estimate,
+                                   TimeFrequencyTracker::Estimate &averagedEstimate)
+{
+  if (!estimate.valid)
+  {
+    resetMeasurementAccumulator();
+    return false;
+  }
+
+  measurementAccumulator.estimatedFrequencySum += estimate.estimatedFrequencyHz;
+  measurementAccumulator.rawPeakFrequencySum += estimate.rawPeakFrequencyHz;
+  measurementAccumulator.magnitudeSum += estimate.magnitude;
+  measurementAccumulator.scoreSum += estimate.score;
+  measurementAccumulator.signalRmsSum += estimate.signalRms;
+  measurementAccumulator.peakToPeakSum += estimate.peakToPeak;
+  ++measurementAccumulator.sampleCount;
+
+  if (measurementAccumulator.sampleCount < MEASUREMENT_AVERAGE_COUNT)
+  {
+    return false;
+  }
+
+  const float sampleCount = static_cast<float>(measurementAccumulator.sampleCount);
+  averagedEstimate = estimate;
+  averagedEstimate.estimatedFrequencyHz = measurementAccumulator.estimatedFrequencySum / sampleCount;
+  averagedEstimate.rawPeakFrequencyHz = measurementAccumulator.rawPeakFrequencySum / sampleCount;
+  averagedEstimate.magnitude = measurementAccumulator.magnitudeSum / sampleCount;
+  averagedEstimate.score = measurementAccumulator.scoreSum / sampleCount;
+  averagedEstimate.signalRms = measurementAccumulator.signalRmsSum / sampleCount;
+  averagedEstimate.peakToPeak = measurementAccumulator.peakToPeakSum / sampleCount;
+  averagedEstimate.valid = true;
+
+  resetMeasurementAccumulator();
+  return true;
+}
+
+bool bq25895mReadRegister(uint8_t reg, uint8_t &value)
+{
+  Wire.beginTransmission(BQ25895M_I2C_ADDRESS);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0)
+  {
+    return false;
+  }
+
+  if (Wire.requestFrom(static_cast<int>(BQ25895M_I2C_ADDRESS), 1) != 1)
+  {
+    return false;
+  }
+
+  value = Wire.read();
+  return true;
+}
+
+bool bq25895mWriteRegister(uint8_t reg, uint8_t value)
+{
+  Wire.beginTransmission(BQ25895M_I2C_ADDRESS);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool ensureBq25895mAdcContinuous()
+{
+  uint8_t adcControl = 0;
+  if (!bq25895mReadRegister(BQ25895M_REG_ADC_CONTROL, adcControl))
+  {
+    return false;
+  }
+
+  if ((adcControl & BQ25895M_ADC_CONTINUOUS_MASK) != 0)
+  {
+    return true;
+  }
+
+  adcControl |= BQ25895M_ADC_CONTINUOUS_MASK;
+  return bq25895mWriteRegister(BQ25895M_REG_ADC_CONTROL, adcControl);
+}
+
+int batteryVoltageToPercent(float voltageV)
+{
+  constexpr size_t pointCount = sizeof(BATTERY_PERCENT_CURVE) / sizeof(BATTERY_PERCENT_CURVE[0]);
+  if (voltageV >= BATTERY_PERCENT_CURVE[0].voltageV)
+  {
+    return BATTERY_PERCENT_CURVE[0].percent;
+  }
+
+  for (size_t i = 1; i < pointCount; ++i)
+  {
+    const BatteryPercentPoint &upper = BATTERY_PERCENT_CURVE[i - 1];
+    const BatteryPercentPoint &lower = BATTERY_PERCENT_CURVE[i];
+    if (voltageV >= lower.voltageV)
+    {
+      const float rangeV = upper.voltageV - lower.voltageV;
+      if (rangeV <= 0.0f)
+      {
+        return lower.percent;
+      }
+
+      const float ratio = (voltageV - lower.voltageV) / rangeV;
+      const float percent = lower.percent + ratio * static_cast<float>(upper.percent - lower.percent);
+      return constrain(static_cast<int>(lroundf(percent)), 0, 100);
+    }
+  }
+
+  return BATTERY_PERCENT_CURVE[pointCount - 1].percent;
+}
+
+bool readBatteryStatus(BatteryStatus &status)
+{
+  if (!ensureBq25895mAdcContinuous())
+  {
+    return false;
+  }
+
+  uint8_t chargerStatus = 0;
+  uint8_t batteryVoltage = 0;
+  if (!bq25895mReadRegister(BQ25895M_REG_CHARGER_STATUS, chargerStatus) ||
+      !bq25895mReadRegister(BQ25895M_REG_BATTERY_VOLTAGE, batteryVoltage))
+  {
+    return false;
+  }
+
+  const uint8_t chargeState = (chargerStatus >> 3) & 0x03;
+  const uint8_t batteryAdc = batteryVoltage & 0x7F;
+
+  status.available = true;
+  status.charging = (chargeState == 0x01 || chargeState == 0x02);
+  status.voltageV = BQ25895M_BATTERY_VOLTAGE_BASE_V +
+                    static_cast<float>(batteryAdc) * BQ25895M_BATTERY_VOLTAGE_STEP_V;
+  status.percent = batteryVoltageToPercent(status.voltageV);
+  return true;
+}
+
+void updateSystemStatusIndicators(bool force)
+{
+  if (!force && millis() - lastSystemStatusUpdateMs < SYSTEM_STATUS_UPDATE_MS)
+  {
+    return;
+  }
+  lastSystemStatusUpdateMs = millis();
+
+  BatteryStatus batteryStatus;
+  const bool batteryStatusValid = readBatteryStatus(batteryStatus);
+  const int batteryPercent = batteryStatusValid ? batteryStatus.percent : 0;
+  const bool chargingVisible = batteryStatusValid && batteryStatus.charging;
+  const bool wifiVisible = OtaTelnet::isWifiConfigured();
+
+  if (force || batteryPercent != lastDisplayedBatteryPercent)
+  {
+    DisplayComm::writeNumber("jBat", batteryPercent);
+    lastDisplayedBatteryPercent = batteryPercent;
+  }
+
+  const int chargingVisibleInt = chargingVisible ? 1 : 0;
+  if (force || chargingVisibleInt != lastDisplayedChargingVisible)
+  {
+    DisplayComm::setVisible("pChargeIcon", chargingVisible);
+    lastDisplayedChargingVisible = chargingVisibleInt;
+  }
+
+  const int wifiVisibleInt = wifiVisible ? 1 : 0;
+  if (force || wifiVisibleInt != lastDisplayedWifiVisible)
+  {
+    DisplayComm::setVisible("wifi", wifiVisible);
+    lastDisplayedWifiVisible = wifiVisibleInt;
+  }
+}
+
+void setTunedDisplayHighlight(bool enabled)
+{
+  const int targetBco = enabled ? DISPLAY_TUNED_BCO : DISPLAY_DEFAULT_BCO;
+  if (lastDisplayedDispBco == targetBco)
+  {
+    return;
+  }
+
+  DisplayComm::writeAttributeNumber("disp", "bco", targetBco);
+  lastDisplayedDispBco = targetBco;
+}
 } // namespace
 
 uint8_t getServoChannelForCurrentString()
@@ -390,10 +673,11 @@ uint8_t getServoChannelForCurrentString()
   return STRINGS[currentStringIndex].servoChannel;
 }
 
-void centerServoChannel(uint8_t channel)
-{
-  pwmDriver.setPWM(channel, 0, SERVO_CENTER);
-}
+// Unused manual-centering helper kept for possible servo calibration.
+// void centerServoChannel(uint8_t channel)
+// {
+//   pwmDriver.setPWM(channel, 0, SERVO_CENTER);
+// }
 
 void disableServoChannel(uint8_t channel)
 {
@@ -432,6 +716,7 @@ void startServoPulse(uint8_t channel, bool tightenDirection, uint16_t servoOffse
   servoPulseActive = true;
   activeServoChannel = channel;
   servoPulseStopAtMs = millis() + pulseDurationMs;
+  resetMeasurementAccumulator();
   resetFrequencyTracker();
 }
 
@@ -456,36 +741,45 @@ bool commandServoStepFromError(float targetFrequency, float measuredFrequency)
 {
   const float errorHz = measuredFrequency - targetFrequency;
   const float absErrorHz = fabsf(errorHz);
-  if (absErrorHz <= FINE_TOLERANCE * targetFrequency)
+  if (absErrorHz <= FINE_TOLERANCE_HZ)
   {
     return false;
   }
 
-  uint16_t servoOffset = SERVO_FINE_OFFSET;
-  unsigned long pulseDurationMs = SERVO_FINE_PULSE_MS;
-  if (absErrorHz >= SERVO_COARSE_ERROR_HZ)
+  const uint8_t channel = getServoChannelForCurrentString();
+  // Match the original servo polarity: when the measured frequency is above target,
+  // drive the PWM to the positive side of center; below target goes to the negative side.
+  const bool tightenDirection = errorHz > 0.0f;
+
+  uint16_t servoOffset = SERVO_STEP_AGGRESSIVE_OFFSET;
+  unsigned long pulseDurationMs = SERVO_STEP_AGGRESSIVE_PULSE_MS;
+  if (absErrorHz <= SERVO_FINE_STEP_THRESHOLD_HZ)
   {
-    servoOffset = SERVO_COARSE_OFFSET;
-    pulseDurationMs = SERVO_COARSE_PULSE_MS;
+    servoOffset = SERVO_STEP_FINE_OFFSET;
+    pulseDurationMs = SERVO_STEP_FINE_PULSE_MS;
   }
-  else if (absErrorHz >= SERVO_MEDIUM_ERROR_HZ)
+  else if (absErrorHz <= SERVO_MEDIUM_STEP_THRESHOLD_HZ)
   {
-    servoOffset = SERVO_MEDIUM_OFFSET;
-    pulseDurationMs = SERVO_MEDIUM_PULSE_MS;
+    servoOffset = SERVO_STEP_MEDIUM_OFFSET;
+    pulseDurationMs = SERVO_STEP_MEDIUM_PULSE_MS;
+  }
+  else if (absErrorHz <= SERVO_COARSE_STEP_THRESHOLD_HZ)
+  {
+    servoOffset = SERVO_STEP_COARSE_OFFSET;
+    pulseDurationMs = SERVO_STEP_COARSE_PULSE_MS;
   }
 
-  const uint8_t channel = getServoChannelForCurrentString();
-  const bool tightenDirection = errorHz < 0.0f;
   startServoPulse(channel, tightenDirection, servoOffset, pulseDurationMs);
   return true;
 }
 
-void centerCurrentServo()
-{
-  const uint8_t activeChannel = getServoChannelForCurrentString();
-  disableInactiveServos(activeChannel);
-  centerServoChannel(activeChannel);
-}
+// Unused manual-centering helper kept for possible servo calibration.
+// void centerCurrentServo()
+// {
+//   const uint8_t activeChannel = getServoChannelForCurrentString();
+//   disableInactiveServos(activeChannel);
+//   centerServoChannel(activeChannel);
+// }
 
 void resetTuningState()
 {
@@ -498,8 +792,10 @@ void resetTuningState()
   trackerConfigured = false;
   trackerConfiguredStringIndex = -1;
   trackerConfiguredLowPass = false;
+  resetMeasurementAccumulator();
   resetFrequencyTracker();
   DisplayComm::resetWaveform();
+  setTunedDisplayHighlight(false);
   stopAllServos();
 }
 
@@ -510,12 +806,12 @@ void updateDisplay(char note, float targetFrequency, float measuredFrequency)
 
 const char *getTuningDirection(float targetFrequency, float measuredFrequency)
 {
-  if (measuredFrequency < targetFrequency * (1.0f - FINE_TOLERANCE))
+  if (measuredFrequency < targetFrequency - FINE_TOLERANCE_HZ)
   {
     return "NIZKO";
   }
 
-  if (measuredFrequency > targetFrequency * (1.0f + FINE_TOLERANCE))
+  if (measuredFrequency > targetFrequency + FINE_TOLERANCE_HZ)
   {
     return "VYSOKO";
   }
@@ -528,6 +824,11 @@ void printTuningStatus(const char *stringName,
                        float measuredFrequency,
                        const TimeFrequencyTracker::Estimate &estimate)
 {
+  if (!measurementStatusLogsEnabled)
+  {
+    return;
+  }
+
   auto &log = LogMirror::out();
   log.print("Ladim strunu: ");
   log.print(stringName);
@@ -555,6 +856,11 @@ void printWeakSignalStatus(const char *stringName,
                            float targetFrequency,
                            const TimeFrequencyTracker::Estimate &estimate)
 {
+  if (!measurementStatusLogsEnabled)
+  {
+    return;
+  }
+
   auto &log = LogMirror::out();
   log.print("Ladim strunu: ");
   log.print(stringName);
@@ -578,6 +884,11 @@ void printWeakSignalStatus(const char *stringName,
 
 void printNoFrequencyStatus(const char *stringName, float targetFrequency)
 {
+  if (!measurementStatusLogsEnabled)
+  {
+    return;
+  }
+
   auto &log = LogMirror::out();
   log.print("Ladim strunu: ");
   log.print(stringName);
@@ -613,6 +924,11 @@ void processCurrentString()
   const float targetFrequency = STRINGS[currentStringIndex].desiredHz;
   const char note = STRINGS[currentStringIndex].note;
 
+  if (lastDisplayedDispBco == DISPLAY_TUNED_BCO)
+  {
+    setTunedDisplayHighlight(false);
+  }
+
   if (!ensureFrequencyTrackerReady())
   {
     stableCount = 0;
@@ -629,12 +945,19 @@ void processCurrentString()
   if (!estimate.valid)
   {
     stableCount = 0;
+    resetMeasurementAccumulator();
     disableServoChannel(getServoChannelForCurrentString());
     printWeakSignalStatus(STRINGS[currentStringIndex].name, targetFrequency, estimate);
     return;
   }
 
-  const float measuredFrequency = estimate.estimatedFrequencyHz;
+  TimeFrequencyTracker::Estimate averagedEstimate;
+  if (!takeAveragedFrequencyEstimate(estimate, averagedEstimate))
+  {
+    return;
+  }
+
+  const float measuredFrequency = averagedEstimate.estimatedFrequencyHz;
 
   results[currentStringIndex].tunedHz = measuredFrequency;
   results[currentStringIndex].hasMeasurement = true;
@@ -645,12 +968,12 @@ void processCurrentString()
     lastDisplayUpdateMs = millis();
   }
 
-  printTuningStatus(STRINGS[currentStringIndex].name, targetFrequency, measuredFrequency, estimate);
+  printTuningStatus(STRINGS[currentStringIndex].name, targetFrequency, measuredFrequency, averagedEstimate);
 
   const float coarseLower = targetFrequency * (1.0f - COARSE_TOLERANCE);
   const float coarseUpper = targetFrequency * (1.0f + COARSE_TOLERANCE);
-  const float fineLower = targetFrequency * (1.0f - FINE_TOLERANCE);
-  const float fineUpper = targetFrequency * (1.0f + FINE_TOLERANCE);
+  const float fineLower = targetFrequency - FINE_TOLERANCE_HZ;
+  const float fineUpper = targetFrequency + FINE_TOLERANCE_HZ;
   const bool withinFineRange = measuredFrequency >= fineLower && measuredFrequency <= fineUpper;
 
   if (measuredFrequency >= coarseLower && measuredFrequency <= coarseUpper &&
@@ -670,10 +993,12 @@ void processCurrentString()
       log.print("NALAZENO: ");
       log.println(STRINGS[currentStringIndex].name);
       disableServoChannel(finishedServoChannel);
+      setTunedDisplayHighlight(true);
       ++currentStringIndex;
       stableCount = 0;
       trackerConfigured = false;
       trackerConfiguredStringIndex = -1;
+      resetMeasurementAccumulator();
       resetFrequencyTracker();
       nextMeasurementAllowedAtMs = millis() + POST_STRING_DELAY_MS;
       if (tunerState == TunerState::Tuning)
@@ -704,7 +1029,7 @@ void setup()
 
   DisplayComm::setConfig(DisplayComm::Config{});
   DisplayComm::setCallbacks(DisplayComm::Callbacks{
-      []() { requestStartTuning(); },
+      []() { return requestStartTuning(); },
       []() {
         LogMirror::out().println("Prijat prikaz STOP.");
         abortTuning(true);
@@ -740,7 +1065,8 @@ void setup()
         status += String("pausedByStop: ") + (pausedByStop ? "true" : "false") + "\n";
         status += String("currentStringIndex: ") + currentStringIndex;
         status += "\n";
-        status += String("filters: ") + (filtersEnabled ? "on" : "off");
+        status += String("filters: ") + (filtersEnabled ? "on" : "off") + "\n";
+        status += String("measurelogs: ") + (measurementStatusLogsEnabled ? "on" : "off");
         return status;
       },
       [](bool enabled) {
@@ -748,6 +1074,11 @@ void setup()
         LogMirror::out().println(String("Filters: ") + (filtersEnabled ? "ON" : "OFF"));
       },
       []() { return filtersEnabled; },
+      [](bool enabled) {
+        measurementStatusLogsEnabled = enabled;
+        LogMirror::out().println(String("Measure logs: ") + (measurementStatusLogsEnabled ? "ON" : "OFF"));
+      },
+      []() { return measurementStatusLogsEnabled; },
   });
   OtaTelnet::begin(WIFI_SSID, WIFI_PASS, OTA_HOSTNAME, OTA_PASSWORD, 3232, TELNET_PORT, TELNET_PASSWORD);
 
@@ -761,6 +1092,7 @@ void setup()
 
   LogMirror::out().println("Auto tuner startuje...");
   resetUiToIdle();
+  updateSystemStatusIndicators(true);
 }
 
 void loop()
@@ -769,6 +1101,7 @@ void loop()
 
   if (tunerState == TunerState::Idle)
   {
+    updateSystemStatusIndicators();
     delay(20);
     return;
   }
@@ -788,11 +1121,13 @@ void loop()
       DisplayComm::setVisible("stop", 1);
       preparingStartedAtMs = millis();
       LogMirror::out().println("Priprava ladeni...");
+      updateSystemStatusIndicators();
       return;
     }
 
     if (millis() - preparingStartedAtMs < WIFI_OFF_DELAY_MS)
     {
+      updateSystemStatusIndicators();
       delay(10);
       return;
     }
@@ -801,6 +1136,7 @@ void loop()
     tunerState = TunerState::Tuning;
     lastDisplayUpdateMs = 0;
     LogMirror::out().println("WiFi vypnuta, zacinam ladit...");
+    updateSystemStatusIndicators();
     return;
   }
 
@@ -811,6 +1147,7 @@ void loop()
       WifiControl::disable();
     }
     processCurrentString();
+    updateSystemStatusIndicators();
     return;
   }
 
@@ -844,6 +1181,7 @@ void loop()
         resetUiToIdle();
       }
     }
+    updateSystemStatusIndicators();
     delay(50);
     return;
   }
@@ -879,4 +1217,5 @@ void resetUiToIdle()
   DisplayComm::writeText("Note", "-");
   DisplayComm::writeNumber("desiredf", 0);
   DisplayComm::writeNumber("currentf", 0);
+  setTunedDisplayHighlight(false);
 }

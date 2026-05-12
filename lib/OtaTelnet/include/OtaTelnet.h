@@ -16,6 +16,10 @@ struct Callbacks
   // Optional: enable/disable FFT filters from the telnet console.
   std::function<void(bool enabled)> setFiltersEnabled;
   std::function<bool()> getFiltersEnabled;
+
+  // Optional: enable/disable verbose measurement status logs.
+  std::function<void(bool enabled)> setMeasurementLogsEnabled;
+  std::function<bool()> getMeasurementLogsEnabled;
 };
 
 void begin(const char *wifiSsid,

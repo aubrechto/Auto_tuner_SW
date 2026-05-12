@@ -1,5 +1,8 @@
 #pragma once
 
+// Unused legacy detector kept for reference; the current firmware uses TimeFrequencyTracker::GoertzelSweepTracker.
+#if 0
+
 #include <Arduino.h>
 
 // Optimized Goertzel tone detector for ESP32 Arduino (float).
@@ -87,3 +90,5 @@ struct Stream
 //   Serial.println(energyA2, 2);
 //
 } // namespace GoertzelDetector
+
+#endif

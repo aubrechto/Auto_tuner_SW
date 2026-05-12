@@ -1,3 +1,6 @@
+// Unused legacy analyzer kept for reference; the current firmware uses TimeFrequencyTracker::GoertzelSweepTracker.
+#if 0
+
 #include "FftAnalyzer.h"
 
 #include <arduinoFFT.h>
@@ -268,3 +271,5 @@ bool findDominantFrequency(uint8_t adcPin,
   return true;
 }
 } // namespace FftAnalyzer
+
+#endif

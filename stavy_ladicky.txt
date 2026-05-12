@@ -1,0 +1,170 @@
+Celý průběh stavů
+==================
+
+Idle -> Preparing -> Tuning -> Finished -> Idle
+
+
+1. Idle
+-------
+
+Program je v klidu a čeká na spuštění ladění.
+
+Volá se:
+
+serviceBackground()
+updateSystemStatusIndicators()
+delay(20)
+
+Funkce:
+
+- serviceBackground() obsluhuje displej, telnet, logování a příkazy ze sériové konzole.
+- updateSystemStatusIndicators() aktualizuje systémové informace na displeji, hlavně baterii, nabíjení a Wi-Fi ikonu.
+- delay(20) krátce zpomalí smyčku, aby procesor neběžel zbytečně naplno.
+
+Přechod dál nastane po STARTu:
+
+requestStartTuning()
+
+- requestStartTuning() zkontroluje, jestli už ladění neběží, a pokud ne, přepne stav na Preparing.
+
+
+2. Preparing
+------------
+
+Program připravuje ladění.
+
+Volá se:
+
+serviceBackground()
+resetTuningState()
+DisplayComm::setVisible("stop", 1)
+updateSystemStatusIndicators()
+WifiControl::disable()
+
+Funkce:
+
+- serviceBackground() dál obsluhuje displej, telnet, logování a příkazy.
+- resetTuningState() vynuluje ladicí proměnné, nastaví první strunu, zastaví serva, resetuje měření a displejovou vlnu.
+- DisplayComm::setVisible("stop", 1) zobrazí na displeji tlačítko STOP.
+- updateSystemStatusIndicators() aktualizuje stav baterie, nabíjení a Wi-Fi na displeji.
+- WifiControl::disable() vypne Wi-Fi rádio, aby nerušilo měření frekvence.
+
+Po krátkém čekání se stav změní na:
+
+tunerState = TunerState::Tuning;
+
+
+3. Tuning
+---------
+
+Program aktivně ladí jednotlivé struny.
+
+Volá se:
+
+serviceBackground()
+WifiControl::isEnabled()
+WifiControl::disable()
+processCurrentString()
+updateSystemStatusIndicators()
+
+Funkce:
+
+- serviceBackground() průběžně obsluhuje komunikaci s displejem, telnetem a konzolí.
+- WifiControl::isEnabled() zjistí, jestli je Wi-Fi rádio stále zapnuté.
+- WifiControl::disable() vypne Wi-Fi, pokud je během ladění zapnutá.
+- processCurrentString() provede celé měření a ladění aktuální struny.
+- updateSystemStatusIndicators() aktualizuje systémové indikátory na displeji.
+
+Uvnitř processCurrentString() se volá:
+
+serviceServoMotion()
+serviceFrequencyTracker()
+ensureFrequencyTrackerReady()
+takeLatestFrequencyEstimate()
+takeAveragedFrequencyEstimate()
+updateDisplay()
+printTuningStatus()
+printWeakSignalStatus()
+printNoFrequencyStatus()
+commandServoStepFromError()
+startServoPulse()
+disableServoChannel()
+setTunedDisplayHighlight()
+resetMeasurementAccumulator()
+resetFrequencyTracker()
+DisplayComm::resetWaveform()
+stopAllServos()
+DisplayComm::setVisible("stop", 0)
+WifiControl::enable()
+
+Funkce:
+
+- serviceServoMotion() hlídá, jestli už skončil pulz serva, a po doběhu servo vypne.
+- serviceFrequencyTracker() čte vzorky z ADC a předává je frekvenčnímu trackeru.
+- ensureFrequencyTrackerReady() zkontroluje, jestli je tracker správně nastavený pro aktuální strunu.
+- takeLatestFrequencyEstimate() vezme poslední nově vypočítaný odhad frekvence.
+- takeAveragedFrequencyEstimate() zprůměruje naměřené odhady frekvence.
+- updateDisplay() zobrazí na displeji notu, cílovou frekvenci a aktuálně naměřenou frekvenci.
+- printTuningStatus() vypíše do logu stav ladění aktuální struny.
+- printWeakSignalStatus() vypíše do logu informaci, že signál je moc slabý.
+- printNoFrequencyStatus() vypíše do logu, že frekvence zatím není k dispozici.
+- commandServoStepFromError() podle rozdílu mezi cílovou a měřenou frekvencí rozhodne, jak má servo pohnout kolíkem.
+- startServoPulse() spustí krátký pohyb serva zvoleným směrem a velikostí kroku.
+- disableServoChannel() vypne konkrétní servo kanál.
+- setTunedDisplayHighlight() změní zvýraznění displeje, když je struna naladěná.
+- resetMeasurementAccumulator() vynuluje nasbírané hodnoty pro průměrování měření.
+- resetFrequencyTracker() resetuje frekvenční tracker, aby další měření začalo čistě.
+- DisplayComm::resetWaveform() smaže nebo resetuje zobrazenou vlnu na displeji.
+- stopAllServos() vypne všechna serva.
+- DisplayComm::setVisible("stop", 0) schová tlačítko STOP.
+- WifiControl::enable() znovu zapne Wi-Fi po dokončení ladění.
+
+Když je jedna struna naladěná, program přejde na další strunu.
+Když jsou naladěné všechny struny, přepne se do:
+
+tunerState = TunerState::Finished;
+
+
+4. Finished
+-----------
+
+Program dokončí ladění, odešle výsledek a vrátí se do klidu.
+
+Volá se:
+
+serviceBackground()
+OtaTelnet::console()
+resetUiToIdle()
+updateSystemStatusIndicators()
+delay(50)
+
+Funkce:
+
+- serviceBackground() stále obsluhuje komunikaci, logování a příkazy.
+- OtaTelnet::console() vrátí telnet konzoli, přes kterou se odešle výsledný report.
+- resetUiToIdle() nastaví displej zpět do klidového stavu.
+- updateSystemStatusIndicators() aktualizuje baterii, nabíjení a Wi-Fi ikonu.
+- delay(50) krátce zpomalí smyčku v dokončovacím stavu.
+
+Po odeslání výsledků se program vrátí zpět do:
+
+tunerState = TunerState::Idle;
+
+
+Zkráceně
+--------
+
+Idle
+  čekání na START
+
+Preparing
+  reset ladění, příprava UI, vypnutí Wi-Fi
+
+Tuning
+  měření frekvence, pohyb servem, postupné ladění strun
+
+Finished
+  odeslání výsledků, návrat displeje do klidu
+
+Idle
+  čekání na další START

@@ -160,6 +160,7 @@ void handleTelnetCommand(String command)
     telnetPrintln("play / start        - spustit ladeni");
     telnetPrintln("stop                - zastavit ladeni");
     telnetPrintln("filters on/off      - FFT filtry zap/vyp");
+    telnetPrintln("measurelogs on/off  - vypis mereni zap/vyp");
     telnetPrintln("reboot              - restart ESP32");
     telnetPrintln("ip                  - IP adresa");
     return;
@@ -203,6 +204,29 @@ void handleTelnetCommand(String command)
       return;
     }
     callbacks.setFiltersEnabled(lower == "filters on");
+    telnetPrintln("OK");
+    return;
+  }
+
+  if (lower == "measurelogs")
+  {
+    if (!callbacks.getMeasurementLogsEnabled)
+    {
+      telnetPrintln("NOT SUPPORTED");
+      return;
+    }
+    telnetPrintln(String("measurelogs: ") + (callbacks.getMeasurementLogsEnabled() ? "on" : "off"));
+    return;
+  }
+
+  if (lower == "measurelogs on" || lower == "measurelogs off")
+  {
+    if (!callbacks.setMeasurementLogsEnabled)
+    {
+      telnetPrintln("NOT SUPPORTED");
+      return;
+    }
+    callbacks.setMeasurementLogsEnabled(lower == "measurelogs on");
     telnetPrintln("OK");
     return;
   }

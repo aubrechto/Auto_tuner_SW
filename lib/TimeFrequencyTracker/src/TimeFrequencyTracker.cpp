@@ -1,6 +1,7 @@
 #include "TimeFrequencyTracker.h"
 
-#include <arduinoFFT.h>
+// Unused while SlidingFftTracker is commented out.
+// #include <arduinoFFT.h>
 #include <math.h>
 #include <new>
 
@@ -141,29 +142,30 @@ bool TrackerBase::pushSample(float rawSample, Estimate &estimate)
   return finalizeEstimate(rawPeakFrequencyHz, magnitude, score, estimate);
 }
 
-size_t TrackerBase::processSamples(const float *samples, size_t sampleCount, Estimate *estimates, size_t maxEstimates)
-{
-  if (!samples || !estimates || maxEstimates == 0)
-  {
-    return 0;
-  }
-
-  size_t produced = 0;
-  for (size_t i = 0; i < sampleCount; ++i)
-  {
-    Estimate estimate;
-    if (pushSample(samples[i], estimate))
-    {
-      if (produced >= maxEstimates)
-      {
-        break;
-      }
-      estimates[produced++] = estimate;
-    }
-  }
-
-  return produced;
-}
+// Unused batch API in the current firmware; streaming pushSample() is used instead.
+// size_t TrackerBase::processSamples(const float *samples, size_t sampleCount, Estimate *estimates, size_t maxEstimates)
+// {
+//   if (!samples || !estimates || maxEstimates == 0)
+//   {
+//     return 0;
+//   }
+//
+//   size_t produced = 0;
+//   for (size_t i = 0; i < sampleCount; ++i)
+//   {
+//     Estimate estimate;
+//     if (pushSample(samples[i], estimate))
+//     {
+//       if (produced >= maxEstimates)
+//       {
+//         break;
+//       }
+//       estimates[produced++] = estimate;
+//     }
+//   }
+//
+//   return produced;
+// }
 
 bool TrackerBase::validateAndStoreConfig(const Config &config)
 {
@@ -444,145 +446,146 @@ void GoertzelSweepTracker::freeCandidates()
   candidateCount_ = 0;
 }
 
-SlidingFftTracker::~SlidingFftTracker()
-{
-  freeFftBuffers();
-}
-
-bool SlidingFftTracker::onBegin()
-{
-  freeFftBuffers();
-
-  fftReal_ = new (std::nothrow) float[windowSize()];
-  fftImag_ = new (std::nothrow) float[windowSize()];
-  return fftReal_ && fftImag_;
-}
-
-void SlidingFftTracker::onReset()
-{
-  if (!fftReal_ || !fftImag_)
-  {
-    return;
-  }
-
-  for (size_t i = 0; i < windowSize(); ++i)
-  {
-    fftReal_[i] = 0.0f;
-    fftImag_[i] = 0.0f;
-  }
-}
-
-bool SlidingFftTracker::analyzePreparedWindow(float &rawPeakFrequencyHz, float &magnitude, float &score)
-{
-  if (!fftReal_ || !fftImag_)
-  {
-    return false;
-  }
-
-  const float *samples = windowedSamples();
-  for (size_t i = 0; i < windowSize(); ++i)
-  {
-    fftReal_[i] = samples[i];
-    fftImag_[i] = 0.0f;
-  }
-
-  ArduinoFFT<float> fft(fftReal_, fftImag_, static_cast<uint_fast16_t>(windowSize()), sampleRateHz());
-  fft.compute(FFTDirection::Forward);
-  fft.complexToMagnitude();
-
-  float bestScore = -1.0f;
-  float bestMagnitude = 0.0f;
-  float bestFrequencyHz = 0.0f;
-
-  const size_t candidateCount = frequencyCountForSweep(config().minFrequencyHz, config().maxFrequencyHz, config().frequencyStepHz);
-  for (size_t i = 0; i < candidateCount; ++i)
-  {
-    const float candidateFrequencyHz = config().minFrequencyHz + (config().frequencyStepHz * static_cast<float>(i));
-    if (config().enableRejectBand &&
-        isInsideBand(candidateFrequencyHz, config().rejectBandCenterHz, config().rejectBandHalfWidthHz))
-    {
-      continue;
-    }
-
-    const float fundamentalMagnitude = magnitudeAtFrequency(candidateFrequencyHz);
-    float candidateScore = fundamentalMagnitude;
-    candidateScore += config().harmonicWeight2 * magnitudeAtFrequency(candidateFrequencyHz * 2.0f);
-    candidateScore += config().harmonicWeight3 * magnitudeAtFrequency(candidateFrequencyHz * 3.0f);
-
-    if (candidateScore > bestScore)
-    {
-      bestScore = candidateScore;
-      bestMagnitude = fundamentalMagnitude;
-      bestFrequencyHz = interpolatePeakFrequency(candidateFrequencyHz);
-    }
-  }
-
-  rawPeakFrequencyHz = bestFrequencyHz;
-  magnitude = bestMagnitude;
-  score = bestScore > 0.0f ? bestScore : 0.0f;
-  return true;
-}
-
-void SlidingFftTracker::freeFftBuffers()
-{
-  delete[] fftReal_;
-  delete[] fftImag_;
-  fftReal_ = nullptr;
-  fftImag_ = nullptr;
-}
-
-float SlidingFftTracker::scoreAtFrequency(float frequencyHz) const
-{
-  return magnitudeAtFrequency(frequencyHz);
-}
-
-float SlidingFftTracker::magnitudeAtFrequency(float frequencyHz) const
-{
-  if (!fftReal_)
-  {
-    return 0.0f;
-  }
-
-  const float nyquistHz = sampleRateHz() * 0.5f;
-  if (frequencyHz <= 0.0f || frequencyHz >= nyquistHz)
-  {
-    return 0.0f;
-  }
-
-  const float bin = (frequencyHz * static_cast<float>(windowSize())) / sampleRateHz();
-  int centerIndex = static_cast<int>(bin + 0.5f);
-  centerIndex = constrain(centerIndex, 1, static_cast<int>(windowSize() / 2U) - 2);
-
-  float localPeak = 0.0f;
-  for (int offset = -1; offset <= 1; ++offset)
-  {
-    const float value = fftReal_[centerIndex + offset];
-    if (value > localPeak)
-    {
-      localPeak = value;
-    }
-  }
-
-  return localPeak;
-}
-
-float SlidingFftTracker::interpolatePeakFrequency(float centerFrequencyHz) const
-{
-  const float bin = (centerFrequencyHz * static_cast<float>(windowSize())) / sampleRateHz();
-  int index = static_cast<int>(bin + 0.5f);
-  index = constrain(index, 1, static_cast<int>(windowSize() / 2U) - 2);
-
-  const float a = fftReal_[index - 1];
-  const float b = fftReal_[index];
-  const float c = fftReal_[index + 1];
-  const float denominator = a - (2.0f * b) + c;
-  float delta = 0.0f;
-  if (fabsf(denominator) > 1e-6f)
-  {
-    delta = 0.5f * (a - c) / denominator;
-    delta = clampFloat(delta, -0.5f, 0.5f);
-  }
-
-  return ((static_cast<float>(index) + delta) * sampleRateHz()) / static_cast<float>(windowSize());
-}
+// Unused FFT-based tracker kept as a reference. The firmware uses GoertzelSweepTracker.
+// SlidingFftTracker::~SlidingFftTracker()
+// {
+//   freeFftBuffers();
+// }
+//
+// bool SlidingFftTracker::onBegin()
+// {
+//   freeFftBuffers();
+//
+//   fftReal_ = new (std::nothrow) float[windowSize()];
+//   fftImag_ = new (std::nothrow) float[windowSize()];
+//   return fftReal_ && fftImag_;
+// }
+//
+// void SlidingFftTracker::onReset()
+// {
+//   if (!fftReal_ || !fftImag_)
+//   {
+//     return;
+//   }
+//
+//   for (size_t i = 0; i < windowSize(); ++i)
+//   {
+//     fftReal_[i] = 0.0f;
+//     fftImag_[i] = 0.0f;
+//   }
+// }
+//
+// bool SlidingFftTracker::analyzePreparedWindow(float &rawPeakFrequencyHz, float &magnitude, float &score)
+// {
+//   if (!fftReal_ || !fftImag_)
+//   {
+//     return false;
+//   }
+//
+//   const float *samples = windowedSamples();
+//   for (size_t i = 0; i < windowSize(); ++i)
+//   {
+//     fftReal_[i] = samples[i];
+//     fftImag_[i] = 0.0f;
+//   }
+//
+//   ArduinoFFT<float> fft(fftReal_, fftImag_, static_cast<uint_fast16_t>(windowSize()), sampleRateHz());
+//   fft.compute(FFTDirection::Forward);
+//   fft.complexToMagnitude();
+//
+//   float bestScore = -1.0f;
+//   float bestMagnitude = 0.0f;
+//   float bestFrequencyHz = 0.0f;
+//
+//   const size_t candidateCount = frequencyCountForSweep(config().minFrequencyHz, config().maxFrequencyHz, config().frequencyStepHz);
+//   for (size_t i = 0; i < candidateCount; ++i)
+//   {
+//     const float candidateFrequencyHz = config().minFrequencyHz + (config().frequencyStepHz * static_cast<float>(i));
+//     if (config().enableRejectBand &&
+//         isInsideBand(candidateFrequencyHz, config().rejectBandCenterHz, config().rejectBandHalfWidthHz))
+//     {
+//       continue;
+//     }
+//
+//     const float fundamentalMagnitude = magnitudeAtFrequency(candidateFrequencyHz);
+//     float candidateScore = fundamentalMagnitude;
+//     candidateScore += config().harmonicWeight2 * magnitudeAtFrequency(candidateFrequencyHz * 2.0f);
+//     candidateScore += config().harmonicWeight3 * magnitudeAtFrequency(candidateFrequencyHz * 3.0f);
+//
+//     if (candidateScore > bestScore)
+//     {
+//       bestScore = candidateScore;
+//       bestMagnitude = fundamentalMagnitude;
+//       bestFrequencyHz = interpolatePeakFrequency(candidateFrequencyHz);
+//     }
+//   }
+//
+//   rawPeakFrequencyHz = bestFrequencyHz;
+//   magnitude = bestMagnitude;
+//   score = bestScore > 0.0f ? bestScore : 0.0f;
+//   return true;
+// }
+//
+// void SlidingFftTracker::freeFftBuffers()
+// {
+//   delete[] fftReal_;
+//   delete[] fftImag_;
+//   fftReal_ = nullptr;
+//   fftImag_ = nullptr;
+// }
+//
+// float SlidingFftTracker::scoreAtFrequency(float frequencyHz) const
+// {
+//   return magnitudeAtFrequency(frequencyHz);
+// }
+//
+// float SlidingFftTracker::magnitudeAtFrequency(float frequencyHz) const
+// {
+//   if (!fftReal_)
+//   {
+//     return 0.0f;
+//   }
+//
+//   const float nyquistHz = sampleRateHz() * 0.5f;
+//   if (frequencyHz <= 0.0f || frequencyHz >= nyquistHz)
+//   {
+//     return 0.0f;
+//   }
+//
+//   const float bin = (frequencyHz * static_cast<float>(windowSize())) / sampleRateHz();
+//   int centerIndex = static_cast<int>(bin + 0.5f);
+//   centerIndex = constrain(centerIndex, 1, static_cast<int>(windowSize() / 2U) - 2);
+//
+//   float localPeak = 0.0f;
+//   for (int offset = -1; offset <= 1; ++offset)
+//   {
+//     const float value = fftReal_[centerIndex + offset];
+//     if (value > localPeak)
+//     {
+//       localPeak = value;
+//     }
+//   }
+//
+//   return localPeak;
+// }
+//
+// float SlidingFftTracker::interpolatePeakFrequency(float centerFrequencyHz) const
+// {
+//   const float bin = (centerFrequencyHz * static_cast<float>(windowSize())) / sampleRateHz();
+//   int index = static_cast<int>(bin + 0.5f);
+//   index = constrain(index, 1, static_cast<int>(windowSize() / 2U) - 2);
+//
+//   const float a = fftReal_[index - 1];
+//   const float b = fftReal_[index];
+//   const float c = fftReal_[index + 1];
+//   const float denominator = a - (2.0f * b) + c;
+//   float delta = 0.0f;
+//   if (fabsf(denominator) > 1e-6f)
+//   {
+//     delta = 0.5f * (a - c) / denominator;
+//     delta = clampFloat(delta, -0.5f, 0.5f);
+//   }
+//
+//   return ((static_cast<float>(index) + delta) * sampleRateHz()) / static_cast<float>(windowSize());
+// }
 } // namespace TimeFrequencyTracker

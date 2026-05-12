@@ -47,7 +47,8 @@ public:
   void reset();
 
   bool pushSample(float rawSample, Estimate &estimate);
-  size_t processSamples(const float *samples, size_t sampleCount, Estimate *estimates, size_t maxEstimates);
+  // Unused batch API in the current firmware; streaming pushSample() is used instead.
+  // size_t processSamples(const float *samples, size_t sampleCount, Estimate *estimates, size_t maxEstimates);
 
   const Config &config() const { return config_; }
 
@@ -55,9 +56,10 @@ protected:
   const float *windowedSamples() const { return preparedWindow_; }
   size_t windowSize() const { return config_.windowSize; }
   float sampleRateHz() const { return config_.sampleRateHz; }
-  float signalRms() const { return signalRms_; }
-  float signalPeakToPeak() const { return signalPeakToPeak_; }
-  bool hasWindow() const { return preparedWindow_ != nullptr; }
+  // Unused protected helpers; current analyzers read these values through Estimate.
+  // float signalRms() const { return signalRms_; }
+  // float signalPeakToPeak() const { return signalPeakToPeak_; }
+  // bool hasWindow() const { return preparedWindow_ != nullptr; }
 
   virtual bool onBegin() = 0;
   virtual void onReset() = 0;
@@ -121,24 +123,25 @@ private:
   size_t candidateCount_ = 0;
 };
 
-class SlidingFftTracker : public TrackerBase
-{
-public:
-  SlidingFftTracker() = default;
-  ~SlidingFftTracker() override;
-
-private:
-  bool onBegin() override;
-  void onReset() override;
-  bool analyzePreparedWindow(float &rawPeakFrequencyHz, float &magnitude, float &score) override;
-  void freeFftBuffers();
-  float scoreAtFrequency(float frequencyHz) const;
-  float magnitudeAtFrequency(float frequencyHz) const;
-  float interpolatePeakFrequency(float centerFrequencyHz) const;
-
-  float *fftReal_ = nullptr;
-  float *fftImag_ = nullptr;
-};
+// Unused FFT-based tracker kept as a reference. The firmware uses GoertzelSweepTracker.
+// class SlidingFftTracker : public TrackerBase
+// {
+// public:
+//   SlidingFftTracker() = default;
+//   ~SlidingFftTracker() override;
+//
+// private:
+//   bool onBegin() override;
+//   void onReset() override;
+//   bool analyzePreparedWindow(float &rawPeakFrequencyHz, float &magnitude, float &score) override;
+//   void freeFftBuffers();
+//   float scoreAtFrequency(float frequencyHz) const;
+//   float magnitudeAtFrequency(float frequencyHz) const;
+//   float interpolatePeakFrequency(float centerFrequencyHz) const;
+//
+//   float *fftReal_ = nullptr;
+//   float *fftImag_ = nullptr;
+// };
 
 // Example use:
 //
