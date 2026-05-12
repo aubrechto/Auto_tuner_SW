@@ -9,8 +9,6 @@ constexpr float SAMPLE_RATE_HZ = 4000.0f;
 constexpr uint32_t SAMPLE_PERIOD_US = static_cast<uint32_t>(1000000.0f / SAMPLE_RATE_HZ);
 
 TimeFrequencyTracker::GoertzelSweepTracker goertzelTracker;
-// Unused FFT tracker example path kept commented out with the disabled SlidingFftTracker implementation.
-// TimeFrequencyTracker::SlidingFftTracker fftTracker;
 uint32_t nextSampleAtUs = 0;
 }
 

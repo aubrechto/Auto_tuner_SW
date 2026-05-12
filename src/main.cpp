@@ -1,6 +1,4 @@
 #include <Arduino.h>
-// Unused in the current firmware; kept commented in case SPI hardware is added later.
-// #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <math.h>
@@ -673,12 +671,6 @@ uint8_t getServoChannelForCurrentString()
   return STRINGS[currentStringIndex].servoChannel;
 }
 
-// Unused manual-centering helper kept for possible servo calibration.
-// void centerServoChannel(uint8_t channel)
-// {
-//   pwmDriver.setPWM(channel, 0, SERVO_CENTER);
-// }
-
 void disableServoChannel(uint8_t channel)
 {
   pwmDriver.setPWM(channel, 0, 0);
@@ -772,14 +764,6 @@ bool commandServoStepFromError(float targetFrequency, float measuredFrequency)
   startServoPulse(channel, tightenDirection, servoOffset, pulseDurationMs);
   return true;
 }
-
-// Unused manual-centering helper kept for possible servo calibration.
-// void centerCurrentServo()
-// {
-//   const uint8_t activeChannel = getServoChannelForCurrentString();
-//   disableInactiveServos(activeChannel);
-//   centerServoChannel(activeChannel);
-// }
 
 void resetTuningState()
 {
